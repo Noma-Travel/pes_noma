@@ -572,15 +572,15 @@ class Specialist:
             # Important: Because we had to create a response message in advance, we are upserting an existing message, not creating a new one. 
             #  The upsert only takes 'content', '_interface' and '_next' changes. 
             
-            self.AGU.save_chat(tool_out,interface=interface, next = c_id)     
+            self.AGU.save_chat(tool_out,interface=interface, next=c_id)     
             
             
-            print(f'act:flag3')
+            print(f'act:Saved tool results to chat')
             
             # Results coming from the handler
-            self._update_context(execute_intention_results=tool_out,tool_response_c_id=c_id)
+            self._update_context(tool_response_c_id=c_id)
             
-            print(f'act:flag4')
+            print(f'act:Saved tool response c_id to context')
             
             # Save handler result to workspace
             
@@ -1000,7 +1000,7 @@ class Specialist:
                     # Or agent is answering questions directly from the belief system.
                     print(f'Run() >> Specialist exits because it sent a direct message to the user.')
                     
-                    self.AGU.print_chat(f'Specialist > 🤖','transient')
+                    self.AGU.print_chat(f'🤖','transient')
                     
                     # The above code is creating a Python dictionary named `output` with a single
                     # key-value pair. The key is 'status' and the value is 'awaiting'.
