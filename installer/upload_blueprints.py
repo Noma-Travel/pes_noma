@@ -10,7 +10,7 @@ from pathlib import Path
 '''
     USAGE
     python upload_blueprints.py <namespace> --aws-profile maker --aws-region us-east-1  
-    python upload_blueprints.py <namespace> --aws-profile maker --aws-region us-east-1 --blueprint noma_attendants
+    python upload_blueprints.py <namespace> --aws-profile maker --aws-region us-east-1 --blueprint x
 '''
 
 def get_available_aws_profiles():

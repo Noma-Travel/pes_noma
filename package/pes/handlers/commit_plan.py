@@ -32,7 +32,7 @@ class RequestContext:
     entity_type: str = ''
     entity_id: str = ''
     thread: str = ''
-    leg: str = ''
+    init: Dict[str, Any] = field(default_factory=dict)
     search_results: Dict[str, Any] = field(default_factory=dict)
     query_params: Dict[str, Any] = field(default_factory=dict)
 
@@ -391,62 +391,58 @@ class CommitPlan:
             entity_type = self._get_context().entity_type
             entity_id = self._get_context().entity_id
             thread = self._get_context().thread
+            init = self._get_context().init
             
-            if entity_type == 'org-trip':
-                
-                #parts = entity_id.split('-')
-                #thread = '-'.join(parts[1:])
+            
                                 
-                # Get the workspaces in this thread 
-                response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread) 
-                workspaces_list = response['items']
-                print('WORKSPACES_LIST >>',workspaces_list)
-                
-                if not workspaces_list or len(workspaces_list) == 0:
-                    print('No workspaces found')
-                    return {
-                        'success': False,
-                        'action': action,
-                        'error': 'No workspaces found for this thread',
-                        'output': 0
-                    }
-                
-                # Extract cache from workspace
-                workspace = workspaces_list[0]
-                if 'cache' not in workspace:
-                    print('No cache found in workspace')
-                    return {
-                        'success': False,
-                        'action': action,
-                        'error': 'No cache found in workspace',
-                        'output': 0
-                    }
-                
-                cache_key = 'irn:tool_rs:pes/generate_plan'
-                if cache_key not in workspace['cache']:
-                    print(f'Cache key {cache_key} not found')
-                    return {
-                        'success': False,
-                        'action': action,
-                        'error': f'Cache key {cache_key} not found in workspace',
-                        'output': 0
-                    }
-                
-                
-                plan = workspace['cache'][cache_key]['output']['plan']
-                signature = workspace['cache'][cache_key]['output']['signature']
-                
-                print('Plan:',plan)
-                print('Signature:',signature)
-                return {'success':True,'action':action,'input':'','output':plan}
-                
-            else:
+            # Get the workspaces in this thread 
+            response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread) 
+            workspaces_list = response['items']
+            print('WORKSPACES_LIST >>',workspaces_list)
+            
+            if not workspaces_list or len(workspaces_list) == 0:
+                print('No workspaces found')
                 return {
                     'success': False,
                     'action': action,
-                    'error': f'Unsupported entity_type: {entity_type}',
+                    'error': 'No workspaces found for this thread',
                     'output': 0
                 }
+            
+            # Extract cache from workspace
+            workspace = workspaces_list[0]
+            if 'cache' not in workspace:
+                print('No cache found in workspace')
+                return {
+                    'success': False,
+                    'action': action,
+                    'error': 'No cache found in workspace',
+                    'output': 0
+                }
+            
+            if 'plan_cache_key' in init:
+                cache_key = f'irn:tool_rs:{init["plan_cache_key"]}'
+            else:    
+                cache_key = 'irn:tool_rs:pes/generate_plan'
+                
+            if cache_key not in workspace['cache']:
+                print(f'Cache key {cache_key} not found')
+                return {
+                    'success': False,
+                    'action': action,
+                    'error': f'Plan with cache key {cache_key} not found in workspace',
+                    'output': 0
+                }
+            
+            
+            plan = workspace['cache'][cache_key]['output']['plan']
+            signature = workspace['cache'][cache_key]['output']['signature']
+            
+            print('Plan:',plan)
+            print('Signature:',signature)
+            return {'success':True,'action':action,'input':'','output':plan}
+            
+        
                 
         except Exception as e:
             print(f'Error in find_in_cache: {str(e)}')
@@ -464,7 +460,8 @@ class CommitPlan:
         function = 'add_plan'
         
         try:
- 
+            pr = f'add_plan > plan: {plan}'
+            print(pr)
             saved = self.AGU.mutate_workspace({'plan': plan})
             plan_id = plan['id']
             
@@ -531,6 +528,11 @@ class CommitPlan:
             context.thread = payload['_thread']
         else:
             return {'success':False,'action':action,'input':payload,'output':'No thread provided'}
+        
+        if '_init' in payload:
+            context.init = payload['_init']
+        else:
+            context.init = {}
                 
         self._set_context(context)
         

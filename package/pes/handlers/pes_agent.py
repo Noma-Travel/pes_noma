@@ -683,8 +683,16 @@ class PesAgent:
         list_tools_raw = self._get_context().list_tools
         
         list_handlers = {}
+        list_inits = {}
         for t in list_tools_raw:
             list_handlers[t.get('key', '')] = t.get('handler', '')
+            init_value = t.get('init', {})
+            if isinstance(init_value, str):
+                try:
+                    init_value = json.loads(init_value)
+                except (json.JSONDecodeError, ValueError):
+                    init_value = {}
+            list_inits[t.get('key', '')] = init_value if isinstance(init_value, dict) else {}
             
         self._update_context(list_handlers=list_handlers)
     
@@ -719,6 +727,12 @@ class PesAgent:
                 print(error_msg)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
+            
+            # Check if init exists and is valid
+            handler_init = {}
+            if not isinstance(list_inits[tool_name], str) and isinstance(list_inits[tool_name], dict):
+                handler_init = list_inits[tool_name]
+                
                 
             # Check if handler has the right format
             handler_route = list_handlers[tool_name]
@@ -738,6 +752,7 @@ class PesAgent:
             params['_entity_type'] = self._get_context().entity_type
             params['_entity_id'] = self._get_context().entity_id
             params['_thread'] = self._get_context().thread
+            params['_init'] = handler_init
             
             # Add the extra parameters to the params object
             if extra and isinstance(extra, dict):
@@ -1091,12 +1106,14 @@ class PesAgent:
                     # No tool needs execution. 
                     # Most likely the agent is asking for more information to fill tool parameters. 
                     # Or agent is answering questions directly from the belief system.
-                    self.AGU.print_chat(f'🤖','text')
+                    self.AGU.print_chat(f'🤖','transient')
                     return {'success':True,'action':action,'input':payload,'output':results}
                                 
                 else:
                     # Step 2: Act. Agent runs the tool
-                    extra = {'case_group':'x'}
+                    extra = {
+                        'case_group':'x'
+                        }
                     
                     #Validate that response_2['output'] has this format inside : ['tool_calls'][0]['function']['name'] before calling act
                     try:
