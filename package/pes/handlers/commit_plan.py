@@ -504,13 +504,13 @@ class CommitPlan:
         context = RequestContext()
         
         # Update context with payload data
-        if '_portfolio' in payload:
-            context.portfolio = payload['_portfolio']
+        if '_portfolio' in payload or 'portfolio' in payload:
+            context.portfolio = payload.get('_portfolio', payload.get('portfolio'))
         else:
             return {'success':False,'action':action,'input':payload,'output':'No portfolio provided'}
         
-        if '_org' in payload:
-            context.org = payload['_org']
+        if '_org' in payload or 'org' in payload:
+            context.org = payload.get('_org', payload.get('org'))
         else:
             context.org = '_all' #If no org is provided, we switch the Agent to portfolio level
 

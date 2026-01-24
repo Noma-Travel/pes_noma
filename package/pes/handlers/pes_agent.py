@@ -1094,8 +1094,28 @@ class PesAgent:
                 loops = loops + 1
                 print(f'Loop iteration {loops}/{loop_limit}')
                 
+                # Filter actions to only include the current action (security: prevent prompt hacking)
+                list_actions_specific = [action for action in context.list_actions if action.get('key') == current_action]
+                
+                # Get tools_reference from the current action
+                list_tools_specific = []
+                if list_actions_specific:
+                    current_action_obj = list_actions_specific[0]
+                    tools_reference = current_action_obj.get('tools_reference', '')
+                    
+                    # Parse tools_reference (comma-separated string of tool keys)
+                    if tools_reference and tools_reference not in ['_', '-', '.', '']:
+                        # Split by comma and strip whitespace
+                        tool_keys = [key.strip() for key in tools_reference.split(',') if key.strip()]
+                        
+                        # Filter tools to only include those referenced by the current action
+                        list_tools_specific = [
+                            tool for tool in context.list_tools 
+                            if tool.get('key') in tool_keys
+                        ]
+                
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message       
-                response_2 = self.AGU.interpret(list_actions=context.list_actions,list_tools=context.list_tools)
+                response_2 = self.AGU.interpret(list_actions=list_actions_specific,list_tools=list_tools_specific)
                 results.append(response_2)
                 if not response_2['success']:
                     # Something went wrong during message interpretation
