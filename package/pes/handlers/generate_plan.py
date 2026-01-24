@@ -29,6 +29,7 @@ class RequestContext:
     search_results: Dict[str, Any] = field(default_factory=dict)
     query_params: Dict[str, Any] = field(default_factory=dict)
     case_group: str = ''
+    init: str = ''
     
     
 
@@ -1516,6 +1517,11 @@ class GeneratePlan:
             context.case_group = payload['case_group']
         else:
             return {'success':False,'function':function,'input':payload,'output':'No case group provided'}
+        
+        if '_init' in payload:
+            context.init = payload['_init']
+        else:
+            context.init = {}
         
         try:
             self._set_context(context)
