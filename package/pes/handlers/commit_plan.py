@@ -420,27 +420,30 @@ class CommitPlan:
                     'output': 0
                 }
             
+            cache_keys = []
             if 'plan_cache_key' in init:
-                cache_key = f'irn:tool_rs:{init["plan_cache_key"]}'
+                cache_keys.append(f'irn:tool_rs:{init["plan_cache_key"]}')
             else:    
-                cache_key = 'irn:tool_rs:pes/generate_plan'
+                cache_keys.append('irn:tool_rs:pes/modify_plan')
+                cache_keys.append('irn:tool_rs:pes/generate_plan')
                 
-            if cache_key not in workspace['cache']:
-                print(f'Cache key {cache_key} not found')
-                return {
-                    'success': False,
-                    'action': action,
-                    'error': f'Plan with cache key {cache_key} not found in workspace',
-                    'output': 0
-                }
-            
-            
-            plan = workspace['cache'][cache_key]['output']['plan']
-            signature = workspace['cache'][cache_key]['output']['signature']
-            
-            print('Plan:',plan)
-            print('Signature:',signature)
-            return {'success':True,'action':action,'input':'','output':plan}
+            for cache_key in cache_keys:
+                entry = workspace['cache'].get(cache_key)
+                if not entry:
+                    continue
+                output = entry.get('output') or {}
+                plan = output.get('plan')
+                if plan is not None:
+                    print('Plan:', plan)
+                    return {'success': True, 'action': action, 'input': '', 'output': plan}
+                
+            print(f'Cache key {cache_key} not found')
+            return {
+                'success': False,
+                'action': action,
+                'error': f'Plan with cache key {cache_key} not found in workspace',
+                'output': 0
+            }
             
         
                 

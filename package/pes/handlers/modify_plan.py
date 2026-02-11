@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple, Protocol
+from typing import Any, Dict, List, Optional, Tuple, Protocol, Union
 import json, uuid, re
 import os
 from decimal import Decimal
@@ -27,6 +27,9 @@ class RequestContext:
     search_results: Dict[str, Any] = field(default_factory=dict)
     query_params: Dict[str, Any] = field(default_factory=dict)
     case_group: str = ''
+    init: Dict[str, Any] = field(default_factory=dict)
+    trip: Dict[str, Any] = field(default_factory=dict)
+    
     
     
 
@@ -307,14 +310,14 @@ class Modifier:
         Args:
             existing_plan: The current plan to modify
             modification_request: Human-readable paragraph describing what changes to make
-            state_machine: Optional execution state machine showing which steps have been completed
-            trip: Optional trip document showing what reservations already exist
+            state_machine: Optional execution state machine showing which steps have been completed 
+            trip: Optional trip document showing what reservations already exist 
             
         Returns:
             Dictionary with success status and modified plan
         """
         function = 'modify'
-        print('Initiating plan modification process...')
+        print('Initiating plan modification process')
         print(f'Modification request: {modification_request}')
         if state_machine:
             print(f'State machine provided: {len(state_machine.get("steps", []))} steps')
@@ -329,7 +332,7 @@ class Modifier:
         }
         
         # Build action catalog summary for reference
-        catalog_summary = [{"name": t.key, "required_args": t.required_args} for t in self.action_catalog]
+        catalog_summary = [{"name": t.key, "required_args": t.required_args, "optional_args": t.optional_args} for t in self.action_catalog]
         
         # Prepare state machine and trip information for prompt
         state_machine_json = json.dumps(state_machine, indent=2, cls=DecimalEncoder) if state_machine else None
@@ -354,12 +357,12 @@ class Modifier:
             # Add state machine and trip if provided, otherwise use placeholder
             # Format with JSON code blocks for proper display
             if state_machine_json:
-                replacements['state_machine'] = f'STATE MACHINE (execution status):\n```json\n{state_machine_json}\n```'
+                replacements['state_machine'] = f'STATE MACHINE (execution status):{state_machine_json}'
             else:
                 replacements['state_machine'] = ''
             
             if trip_json:
-                replacements['trip'] = f'TRIP DOCUMENT (existing reservations):\n```json\n{trip_json}\n```'
+                replacements['trip'] = f'TRIP DOCUMENT (existing reservations):{trip_json}'
             else:
                 replacements['trip'] = ''
             
@@ -434,7 +437,7 @@ class Modifier:
             {f'''STATE MACHINE (execution status):
             ```json
             {state_machine_json}
-            ```
+            
             ''' if state_machine_json else ''}
             
             {f'''TRIP DOCUMENT (existing reservations):
@@ -550,8 +553,9 @@ class Modifier:
               - If hotel nights changed, is the return flight date updated?
               - If arrival date changed, are hotel check-in dates updated?
               - If a segment was removed, are dependent segments updated or removed?
-        """
+            """
         
+        print(f'modify LLM Prompt >> {prompt}')
         data = self.llm.complete_json(prompt)
         if not data or "plan" not in data:
             print('[ERROR] LLM returned invalid plan structure')
@@ -817,11 +821,14 @@ class ModifyPlan:
     
     def build_plan_modifier(self, portfolio: str, org: str, 
                          prompt_ring: str = "pes_prompts",
-                         action_ring: str = "schd_actions") -> Modifier:
+                         action_ring: str = "schd_actions",
+                         plan_actions: Optional[List[str]] = None) -> Modifier:
         """
         Build a Modifier instance configured for plan modification.
-        
-        Loads prompts and actions from the database.
+
+        Loads prompts and actions from the database. If plan_actions is provided,
+        the action catalog is filtered to only those actions (so the LLM and
+        validator only see allowed actions for this request).
         
         Returns:
             Modifier: Configured agent ready for plan modification operations
@@ -842,6 +849,11 @@ class ModifyPlan:
         # Load actions from database
         action_catalog = self._load_actions(portfolio, org, action_ring)
         
+        # Filter to allowed plan_actions when provided (from payload _init)
+        if plan_actions:
+            allowed = set(plan_actions)
+            action_catalog = [a for a in action_catalog if a.key in allowed]
+        
         # Note: If no actions are loaded from database, action_catalog will be empty
         if not action_catalog:
             print('Warning: No actions loaded from database, action_catalog will be empty')
@@ -850,7 +862,7 @@ class ModifyPlan:
         # The modify() method works directly with the existing plan and modification request
 
         return Modifier(llm=llm, action_catalog=action_catalog, prompts=prompts)
-
+    
     
     def run(self, payload):
         
@@ -891,6 +903,21 @@ class ModifyPlan:
         if 'plan' not in payload:
             return {'success':False,'function':function,'input':payload,'output':'No existing plan provided'}
         
+        if '_init' in payload:
+            raw = payload['_init']
+            context.init = json.loads(raw) if isinstance(raw, str) else raw
+        else:
+            context.init = {}
+            
+            
+        if 'trip' in payload:
+            raw_trip = payload['trip']
+            context.trip = json.loads(raw_trip) if isinstance(raw_trip, str) else raw_trip
+        else:
+            context.trip = {}
+
+
+        
 
         try:
             self._set_context(context)
@@ -910,11 +937,13 @@ class ModifyPlan:
   
             results = []
             print('Initializing PES>ModifyPlan')
+            plan_actions = (context.init.get('plan_actions') or None) if isinstance(context.init, dict) else None
             modifier = self.build_plan_modifier(
                 portfolio=context.portfolio,
                 org=context.org,
                 prompt_ring="pes_prompts",  # Can be made configurable
-                action_ring="schd_actions"  # Can be made configurable
+                action_ring="schd_actions",  # Can be made configurable
+                plan_actions=plan_actions
             )
             print('Finished building Planner')
             
@@ -968,7 +997,7 @@ class ModifyPlan:
             modification_request = payload['message']
             
             # Parse optional state_machine and trip documents
-            # These come without double wrapping, so simple parsing is sufficient
+            
             state_machine = None
             if 'state_machine' in payload and payload['state_machine']:
                 state_machine_data = payload['state_machine']

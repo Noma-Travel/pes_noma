@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple, Protocol
+from typing import Any, Dict, List, Optional, Tuple, Protocol, Union
 import json, math, time, uuid, re
 import os
 from openai import OpenAI
@@ -29,7 +29,7 @@ class RequestContext:
     search_results: Dict[str, Any] = field(default_factory=dict)
     query_params: Dict[str, Any] = field(default_factory=dict)
     case_group: str = ''
-    init: str = ''
+    init: Dict[str, Any] = field(default_factory=dict)
     
     
 
@@ -267,7 +267,7 @@ class AIResponsesLLM:
                 },
                 "strict": True
             }
-        if task in ("ADAPT_PLAN", "COMPOSE_PLAN"):
+        if task in ("ADAPT_PLAN", "COMPOSE_PLAN", "INCREMENT_PLAN"):
             return {
                 "name": "Plan",
                 "schema": {
@@ -455,10 +455,10 @@ def eval_bool(expr: str, context: Dict[str, Any]) -> bool:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# PlanAgent
+# Planner
 # ────────────────────────────────────────────────────────────────────────────────
 
-class PlanAgent:
+class Planner:
     """
     v2.2:
       - LLM-crafted signature, plan adaptation/composition, and selection
@@ -1147,10 +1147,11 @@ class PlanAgent:
 
         candidate_plans: List[Plan] = []
         if cases:
-            # Convert VDB cases to Case objects for adaptation
+            # Generate plan from example use cases
             case_objects = [self._vdb_case_to_case(c) for c in cases[:3]]
             adapted = self.adapt_from_cases(case_objects, sig, facts)
             candidate_plans.append(adapted)
+        #Generate plan from actions and skills
         composed = self.compose_from_skills(sig, skills[:4])
         candidate_plans.append(composed)
 
@@ -1287,6 +1288,9 @@ class GeneratePlan:
             # Get all action records from the ring
             response = self.DAC.get_a_b(portfolio, org, action_ring, limit=1000)
             if response and 'items' in response:
+                
+                #Filter out
+                
                 for item in response['items']:
                     name = item.get('name', '')
                     key = item.get('key', '')
@@ -1427,7 +1431,9 @@ class GeneratePlan:
                          prompt_ring: str = "pes_prompts",
                          action_ring: str = "schd_actions",
                          case_ring: str = "pes_cases",
-                         fact_ring: str = "pes_facts") -> PlanAgent:
+                         fact_ring: str = "pes_facts",
+                         plan_actions: Union[str, List[str]] = "") -> Planner:
+        
         embedder = SimpleEmbedder()
         vdb = VectorDB(embedder)
         # Pass the AgentUtilities instance to AIResponsesLLM
@@ -1446,9 +1452,24 @@ class GeneratePlan:
         # Load actions from database
         action_catalog = self._load_actions(portfolio, org, action_ring)
         
+        # Filter action catalog to only include actions specified in plan_actions
+        # plan_actions can be a list of strings or a comma-separated string (for backward compatibility)
+        action_catalog_specific = []
+        if plan_actions:
+            # Normalize to a set: handle both list and comma-separated string formats
+            if isinstance(plan_actions, list):
+                plan_actions_set = {action.strip() for action in plan_actions if action.strip()}
+            else:
+                # Backward compatibility: parse comma-separated string
+                plan_actions_set = {action.strip() for action in plan_actions.split(',') if action.strip()}
+            
+            for a in action_catalog:
+                if a.key in plan_actions_set:
+                    action_catalog_specific.append(a)
+  
         # Note: If no actions are loaded from database, action_catalog will be empty
-        if not action_catalog:
-            print('Warning: No actions loaded from database, action_catalog will be empty')
+        if not action_catalog_specific:
+            print('Warning: No actions loaded from database, action_catalog_specific will be empty')
 
         # Load seed cases from database
         seed_cases = self._load_seed_cases(portfolio, org, case_ring, case_group=case_group)
@@ -1486,7 +1507,7 @@ class GeneratePlan:
         if not facts:
             print('Warning: No facts loaded from database, VDB will not have facts')
 
-        return PlanAgent(vdb=vdb, llm=llm, action_catalog=action_catalog, prompts=prompts)
+        return Planner(vdb=vdb, llm=llm, action_catalog=action_catalog_specific, prompts=prompts)
 
     
     def run(self, payload):
@@ -1501,6 +1522,7 @@ class GeneratePlan:
         '''
         # Initialize a new request context
         function = 'run > generate_plan'
+        print(f'Running:{function}')
         context = RequestContext()
         
         if 'portfolio' in payload:
@@ -1519,9 +1541,11 @@ class GeneratePlan:
             return {'success':False,'function':function,'input':payload,'output':'No case group provided'}
         
         if '_init' in payload:
-            context.init = payload['_init']
+            raw = payload['_init']
+            context.init = json.loads(raw) if isinstance(raw, str) else raw
         else:
             context.init = {}
+            
         
         try:
             self._set_context(context)
@@ -1537,16 +1561,26 @@ class GeneratePlan:
                 'some_entity_id',
                 'some_thread'
             ) 
+            
+            print("Agent Utilities initialized")
+            
+            if 'plan_actions' in context.init:
+                plan_actions = context.init['plan_actions']
+            else:    
+                plan_actions = ''
+                
+            print(f'Plan Actions loaded:{plan_actions}')
 
             
             results = []
             print('Initializing PES>GeneratePlan')
-            agent = self.build_plan_generator(
+            planner = self.build_plan_generator(
                 portfolio=context.portfolio,
                 org=context.org,
                 prompt_ring="pes_prompts",  # Can be made configurable
                 action_ring="schd_actions",  # Can be made configurable
-                case_ring="pes_cases"  # Can be made configurable
+                case_ring="pes_cases",  # Can be made configurable
+                plan_actions=plan_actions
             )
             print('Finished building Plan Generator')
             
@@ -1555,7 +1589,7 @@ class GeneratePlan:
             }
             
             
-            response_1 = agent.propose(req)
+            response_1 = planner.propose(req)
             results.append(response_1)
             if not response_1['success']: 
                 return {'success': False, 'output': results}

@@ -10,15 +10,14 @@ optional dependencies are not installed.
 
 # Add your handler exports here
 __all__ = [
-    # 'ExampleHandler',
+    'IncrementPlan',
 ]
 
 def __getattr__(name):
     """Lazy import handlers when accessed."""
-    # Add your handler imports here
-    # if name == 'ExampleHandler':
-    #     from pes.handlers.example_handler import ExampleHandler
-    #     return ExampleHandler
+    if name == 'IncrementPlan':
+        from pes.handlers.increment_plan import IncrementPlan
+        return IncrementPlan
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
