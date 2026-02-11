@@ -1,14 +1,14 @@
 """
-PES Package
+PES Noma Package
 Custom handlers, blueprints, and utilities for the PES platform
 """
 
 from setuptools import setup, find_packages
 
 setup(
-    name="pes-mod",
+    name="pes_noma-mod",
     version="1.0.0",
-    description="PES custom handlers, blueprints, and utilities",
+    description="PES custom handlers, blueprints, and utilities - ",
     author="PES Team",
     packages=find_packages(),
     python_requires=">=3.12",
@@ -18,7 +18,7 @@ setup(
     ],
     include_package_data=True,
     package_data={
-        'pes': ['blueprints/*.json'],
+        'pes_noma': ['blueprints/*.json'],
     },
     classifiers=[
         "Development Status :: 4 - Beta",

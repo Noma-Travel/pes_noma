@@ -4,7 +4,7 @@ PES Handlers Package
 This package provides custom handlers for the PES application.
 
 Usage:
-    from pes.handlers import ExampleHandler
+    from pes_noma.handlers import ExampleHandler
     
     # Use a handler
     handler = ExampleHandler()
