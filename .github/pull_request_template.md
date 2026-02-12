@@ -63,9 +63,11 @@ Staging: Faithful replica of the production environment (with similar data), use
 
 - **Steps to Reproduce:**
 <!-- Clear instructions for the reviewer/tester to validate -->
+    1. Step 1
+    2. Step 2
 
 ## 📸 Evidence
-<!-- Screenshots, videos, logs or GIFs --><!-- On GitHub you can copy and paste the image/gif and it will upload and generate the link for you to put here-->
+<!-- Screenshots, videos, logs or GIFs --><!-- On GitHub you can copy and paste the image/gif and it will upload it and generate the link here automatically-->
 ![Evidence 1](https://media.giphy.com/media/13HgwGsXF0aiGY/giphy.gif)
 
 ## ⚠️ Attention Points / Risks
