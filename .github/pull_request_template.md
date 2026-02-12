@@ -77,7 +77,7 @@ Staging: Faithful replica of the production environment (with similar data), use
  - Breaking Changes (Loss of compatibility with previous versions)
  - Scripts that need to run during deploy
 --> 
-- Attention point A
+ - Attention point A
  - Attention point B
 
 ## ✅ Checklist
