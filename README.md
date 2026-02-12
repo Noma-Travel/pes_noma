@@ -13,6 +13,10 @@ The upstream/original `pes` repository is primarily maintained by Ricardo and Je
 - Main Python package code is under `package/pes_noma/` (e.g. `package/pes_noma/handlers/`).
 - PRs should follow the template in `.github/pull_request_template.md`.
 
+# !!!
+# EVERYTHIN BELOW WAS NOT VALIDATED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!
+
 ## Upstream sync: updating this fork from the original `pes` repo
 
 The recommended workflow is **PR-based**: pull upstream changes into a dedicated “sync” branch in this fork, then merge via PR into our `main` (and/or other long-lived branches). This keeps the update auditable and conflict resolution reviewable.
