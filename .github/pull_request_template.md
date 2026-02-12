@@ -41,6 +41,10 @@ Example:
 | NOMA       | main                                          | 07e74101 | fix: small fix landing page
 -->
 
+```bash
+<PASTE THE TABLE HERE>
+```
+
 ## 🔗 Related Links
 - **Jira/Issue:** <!--[LINK]-->
 - **Docs:** <!--[LINK]-->
