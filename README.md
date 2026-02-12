@@ -1,4 +1,4 @@
-feat## `pes_noma`
+## `pes_noma`
 
 `pes_noma` is the Noma-maintained fork of the original `pes` extension.  
 The upstream/original `pes` repository is primarily maintained by Ricardo and Jesus. This fork exists so the Noma team can:
