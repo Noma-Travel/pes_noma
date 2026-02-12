@@ -7,6 +7,7 @@ from openai import OpenAI
 from collections import Counter
 from decimal import Decimal
 from datetime import datetime
+import yaml
 
 from renglo.agent.agent_utilities import AgentUtilities
 from renglo.common import load_config
@@ -1220,6 +1221,97 @@ class GeneratePlan:
             setattr(context, key, value)
         self._set_context(context)
     
+    def _load_prompts_from_local_file(self) -> Dict[str, str]:
+        """
+        Load prompts from the repository copy only (no DB).
+        Accepts YAML/JSON content stored at pes_prompts.json.
+        """
+        # From handlers/ -> .../extensions
+        extensions_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        path = os.path.join(extensions_root, "noma/package/noma/prompts/pes_prompts.json")
+        
+        try:
+            if not os.path.isfile(path):
+                print(f"Warning: prompt file not found: {path}")
+                return {}
+            
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            
+            if not data:
+                return {}
+            
+            # Files use a top-level "prompts" key; fall back to root dict if absent
+            prompt_section = data.get("prompts") if isinstance(data, dict) else None
+            if prompt_section and isinstance(prompt_section, dict):
+                prompts = {k: v for k, v in prompt_section.items() if isinstance(v, str)}
+                if prompts:
+                    print(f"Loaded prompts from local file: {path}")
+                    return prompts
+        except Exception as e:
+            print(f"Warning: Could not load prompts from file {path}: {str(e)}")
+        
+        return {}
+    
+    def _load_seed_cases_from_local_file(self) -> List[Dict[str, Any]]:
+        """
+        Load seed cases from the repository copy only (no DB).
+        Accepts JSON content stored at pes/seed_cases.json.
+        """
+        extensions_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        path = os.path.join(extensions_root, "pes/package/pes/seed_cases.json")
+        
+        try:
+            if not os.path.isfile(path):
+                print(f"Warning: seed case file not found: {path}")
+                return []
+            
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            
+            if not data or not isinstance(data, list):
+                return []
+            
+            cases: List[Dict[str, Any]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                
+                text_blob = item.get("text")
+                meta = item.get("meta", {})
+                
+                parsed_case: Optional[Dict[str, Any]] = None
+                if isinstance(text_blob, str):
+                    try:
+                        parsed_case = json.loads(text_blob)
+                    except Exception:
+                        parsed_case = None
+                elif isinstance(text_blob, dict):
+                    parsed_case = text_blob
+                
+                if not parsed_case:
+                    continue
+                
+                signature_text = parsed_case.get("signature")
+                if isinstance(signature_text, dict):
+                    signature_text = json.dumps(signature_text)
+                
+                plan_data = parsed_case.get("plan", {})
+                if signature_text and plan_data:
+                    cases.append({
+                        "signature": signature_text,
+                        "plan": plan_data,
+                        "meta": meta if isinstance(meta, dict) else {}
+                    })
+            
+            if cases:
+                print(f"Loaded seed cases from local file: {path}")
+            return cases
+        except Exception as e:
+            print(f"Warning: Could not load seed cases from file {path}: {str(e)}")
+        
+        return []
+    
     def _load_prompts(self, portfolio: str, org: str, prompt_ring: str = "pes_prompts", case_group: str = None) -> Dict[str, str]:
         """
         Load prompts from database.
@@ -1443,37 +1535,44 @@ class GeneratePlan:
         context = self._get_context()
         case_group = context.case_group if context else None
         
-        # Use prompts from initialization if available, otherwise load from database
-        if self.prompts:
-            prompts = self.prompts
-        else:
-            prompts = self._load_prompts(portfolio, org, prompt_ring, case_group=case_group)
+        # USE PROMPTS ON THE LOCAL FILES
+        prompts = self._load_prompts_from_local_file()
+
+        # # Use prompts from initialization if available, otherwise load from database
+        # if self.prompts:
+        #     prompts = self.prompts
+        # else:
+        #     prompts = self._load_prompts(portfolio, org, prompt_ring, case_group=case_group)
         
+
         # Load actions from database
         action_catalog = self._load_actions(portfolio, org, action_ring)
         
         # Filter action catalog to only include actions specified in plan_actions
         # plan_actions can be a list of strings or a comma-separated string (for backward compatibility)
-        action_catalog_specific = []
-        if plan_actions:
-            # Normalize to a set: handle both list and comma-separated string formats
-            if isinstance(plan_actions, list):
-                plan_actions_set = {action.strip() for action in plan_actions if action.strip()}
-            else:
-                # Backward compatibility: parse comma-separated string
-                plan_actions_set = {action.strip() for action in plan_actions.split(',') if action.strip()}
+        action_catalog_specific = action_catalog
+        # action_catalog_specific = []
+        # if plan_actions:
+        #     # Normalize to a set: handle both list and comma-separated string formats
+        #     if isinstance(plan_actions, list):
+        #         plan_actions_set = {action.strip() for action in plan_actions if action.strip()}
+        #     else:
+        #         # Backward compatibility: parse comma-separated string
+        #         plan_actions_set = {action.strip() for action in plan_actions.split(',') if action.strip()}
             
-            for a in action_catalog:
-                if a.key in plan_actions_set:
-                    action_catalog_specific.append(a)
+        #     for a in action_catalog:
+        #         if a.key in plan_actions_set:
+        #             action_catalog_specific.append(a)
   
-        # Note: If no actions are loaded from database, action_catalog will be empty
-        if not action_catalog_specific:
-            print('Warning: No actions loaded from database, action_catalog_specific will be empty')
+        # # Note: If no actions are loaded from database, action_catalog will be empty
+        # if not action_catalog_specific:
+        #     print('Warning: No actions loaded from database, action_catalog_specific will be empty')
 
-        # Load seed cases from database
-        seed_cases = self._load_seed_cases(portfolio, org, case_ring, case_group=case_group)
-        
+        # USE SEED_CASES_FROM_LOCAL_FILE
+        seed_cases = self._load_seed_cases_from_local_file()
+        # if not seed_cases:
+        #     seed_cases = self._load_seed_cases(portfolio, org, case_ring, case_group=case_group)
+
         # Add seed cases to VectorDB
         for case_data in seed_cases:
             signature_text = case_data.get('signature', '')
@@ -1538,8 +1637,10 @@ class GeneratePlan:
         if 'case_group' in payload:
             context.case_group = payload['case_group']
         else:
-            return {'success':False,'function':function,'input':payload,'output':'No case group provided'}
-        
+            # return {'success':False,'function':function,'input':payload,'output':'No case group provided'}
+            # TEMP: allow console requests without case_group (remove once console sends it)
+            context.case_group = os.getenv("PES_DEFAULT_CASE_GROUP", "default")
+
         if '_init' in payload:
             raw = payload['_init']
             context.init = json.loads(raw) if isinstance(raw, str) else raw
