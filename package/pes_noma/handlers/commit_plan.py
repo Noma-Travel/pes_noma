@@ -398,8 +398,8 @@ class CommitPlan:
             # Get the workspaces in this thread 
             response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread) 
             workspaces_list = response['items']
-            print('WORKSPACES_LIST >>',workspaces_list)
-            
+            #print('WORKSPACES_LIST >>',workspaces_list) #Verboso
+
             if not workspaces_list or len(workspaces_list) == 0:
                 print('No workspaces found')
                 return {
@@ -434,7 +434,7 @@ class CommitPlan:
                 output = entry.get('output') or {}
                 plan = output.get('plan')
                 if plan is not None:
-                    print('Plan:', plan)
+                    #print('Plan:', plan) #Verboso
                     return {'success': True, 'action': action, 'input': '', 'output': plan}
                 
             print(f'Cache key {cache_key} not found')

@@ -458,7 +458,7 @@ class Specialist:
                     else:
                     # This is the LLM asking something to the user. 
                         if tool_result == 'fresh_results':
-                            print(f'Interpret() >> The agent has interpreted the tool results:{validated_result}')
+                            #print(f'Interpret() >> The agent has interpreted the tool results:{validated_result}') #Verboso
                             c_id = self._get_context().tool_response_c_id
                             c_id_parts = c_id.split(':')
                             nonce = c_id_parts[6]
@@ -588,8 +588,10 @@ class Specialist:
             response = self.SHC.handler_call(portfolio, org, tool, handler, params)
             
             #response = {'success':True,'output':{"some":"mockup response"}}
-            
-            print(f'Handler response:{response}')
+
+            #print(f'Handler response:{response}') #Verboso
+            response_no_output = {k: v for k, v in response.items() if k != 'stack'}
+            print(f'Handler response (no output):{response_no_output}')
             
             #raise Exception('Troubleshooting stop')
 
@@ -775,7 +777,7 @@ class Specialist:
             
             for a in self._get_context().list_actions:
                 if a['key'] == self._get_context().current_action:
-                    print(f'@verify:Current Action:{a}')
+                    #print(f'@verify:Current Action:{a}') #Verboso
                     if 'verification' not in a:
                         raise Exception (f'No verification handler found for this action: {a.get("key", "N/A")}')
                             

@@ -327,7 +327,7 @@ class ExecutePlan:
             continuity["tool_step"] = str(payload.get("tool_step", 0))
 
             workspace = self.AGU.get_active_workspace()
-            print("Retrieving plan from active workspace:", workspace)
+            #print("Retrieving plan from active workspace:", workspace) #Verboso
 
             # Validate workspace structure
             if "plan" not in workspace:
@@ -345,10 +345,10 @@ class ExecutePlan:
 
             if plan_state is None:
                 plan_state = self._init_plan_state(plan)
-                
-            print(f'Plan Steps:{plan["steps"]}') 
+
+            #print(f'Plan Steps:{plan["steps"]}') #Verboso
             steps_by_id = {str(step["step_id"]): step for step in plan["steps"]}
-            print(f'PlanState Steps:{plan_state["steps"]}') 
+            #print(f'PlanState Steps:{plan_state["steps"]}') #Verboso
             step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
             
 
