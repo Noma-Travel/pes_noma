@@ -5,13 +5,11 @@ from typing import Any, Callable, Dict, List, Optional
 from decimal import Decimal
 from .specialist import Specialist
 
-
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Decimal):
             return int(obj) if obj % 1 == 0 else float(obj)
         return super(DecimalEncoder, self).default(obj)
-
 
 class ExecutePlan:
     """
@@ -191,7 +189,6 @@ class ExecutePlan:
             if not response["success"]:
                 print("Specialist came back with an error:",response)
 
-
             '''
             When step is complete, this comes back in the response
             response['output'] -> {"status": "completed"}
@@ -299,7 +296,6 @@ class ExecutePlan:
     def _now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-
     # ---------- Public API ----------
 
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -351,8 +347,6 @@ class ExecutePlan:
             #print(f'PlanState Steps:{plan_state["steps"]}') #Verboso
             step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
 
-
-
             #print("Starting plan execution...") #legacy print
             loop = 0
             # This is the plan_steps loop
@@ -390,14 +384,12 @@ class ExecutePlan:
                         #print(pr) #legacy print
                         self.AGU.print_chat(pr, "transient")
 
-
                 # Ensure step_state exists, break if it doesn't
                 if step_id not in step_states_by_id:
                     pr = f"⚠️ Step {step_id} not found in step_states_by_id"
                     #print(pr) #legacy print
                     self.AGU.print_chat(pr, "transient")
                     raise KeyError(f"Step ID '{step_id}' not found in State Machine")
-
 
                 # Check if the step has a status that needs to be skipped
                 step_state = step_states_by_id[step_id]
@@ -407,15 +399,12 @@ class ExecutePlan:
                     #print(f'Skipping step. Status:{step_state["status"]}') #legacy print
                     continue
 
-
-
                 # If the last step completed successfully, it would have declared that step status as completed.
                 # When the new loop starts, the executor should advance to the next step naturally without the need of a special signal or flag from the last step.
                 # This is to make the loops independent from execution threads.
                 # If a step_id doesn't exist in the state machine, loop should be aborted. The steps in the state machine were initialized before entering the loop.
                 # The only reason to skip a step is if it has been completed. Skipping steps with errors could cause a domino effect. Step dependency checks should take care of that.
                 # A step that is waiting for consent or more data, should have status=awaiting. That status is set by the specialist not by the executor.
-
 
                 '''
                 # Respect dependencies
@@ -454,7 +443,6 @@ class ExecutePlan:
                         'status':'running'
                     }
                     self.AGU.mutate_workspace({"step_state": step_status}) # Changes status of the current step
-
 
                     # 1) Input Check
                     self._input_check(step)
@@ -518,16 +506,13 @@ class ExecutePlan:
 
                         print(f'The specialist has declared that step {plan_id}:{step_id} is {status}')
 
-
-
                     if status == 'awaiting':
-                        #print(f'The step has status {status}.') #legacy print
+                        print(f'The step has status {status}.') #legacy print
                         # Breaking the loop to wait for answer from user. Loop will be regenerated with the Continuity id.
                         break
 
                     elif status == 'completed':
-                        #print('Step has been finished, going to the next step in the plan') #legacy print
-
+                        print('Step has been finished, going to the next step in the plan') #legacy print
 
                 except Exception as e:
                     # Update step state and persist to state machine
@@ -544,8 +529,6 @@ class ExecutePlan:
                     step_state["status"] = "failed"
                     step_state["finished_at"] = step_status["finished_at"]
                     step_state["error"] = step_status["error"]
-
-
 
             # Determine overall status
             pr = f"The execution loop has been suspended. Waiting for further action"
@@ -568,7 +551,6 @@ class ExecutePlan:
             summary = self._build_summary(plan_state)
             '''
 
-
             return {
                 "success": True,
                 "function": function,
@@ -588,7 +570,6 @@ class ExecutePlan:
                 "input": payload,
                 "output": e,
             }
-
 
 # ---------- Example usage with your plan ----------
 

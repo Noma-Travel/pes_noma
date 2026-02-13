@@ -14,7 +14,6 @@ from decimal import Decimal
 #from jsonschema import validate, ValidationError
 from openai import OpenAI
 
-
 import json
 import re
 
@@ -68,7 +67,6 @@ class CommitPlan:
         self.DCC = DocsController(config=self.config)
         self.BPC = BlueprintController(config=self.config)
         self.CHC = ChatController(config=self.config)
-
 
     def _get_context(self) -> RequestContext:
         """Get the current request context."""
@@ -185,7 +183,6 @@ class CommitPlan:
             "required": ["image", "amenities", "thumbnail", "latitude", "longitude", "currentPrice", "name", "id", "roomType"]
         }
 
-
         if isinstance(segment, str):
             try:
                 print(f"Attempting to parse JSON string: {segment[:200]}...")  # Show first 200 chars
@@ -244,7 +241,6 @@ class CommitPlan:
 
     '''
 
-
     def _clean_json_string(self, json_str):
         """Clean common JSON formatting issues"""
         import re
@@ -261,8 +257,6 @@ class CommitPlan:
         json_str = re.sub(r'\bNone\b', 'null', json_str)
 
         return json_str
-
-
 
     def clean_json_response(self, response):
         """
@@ -341,14 +335,11 @@ class CommitPlan:
                 #print(f"After raw field cleanup - content: '{cleaned_response}'")
                 return json.loads(cleaned_response)
 
-
         except json.JSONDecodeError as e:
             print(f"Error parsing cleaned JSON response: {e}")
             #print(f"Original response: {response}")
             #print(f"Cleaned response: {cleaned_response}")
             raise
-
-
 
     def llm(self, prompt):
 
@@ -374,7 +365,6 @@ class CommitPlan:
 
             return response.choices[0].message
 
-
         except Exception as e:
             print(f"Error running LLM call: {e}")
             # Only print raw response if it exists
@@ -392,8 +382,6 @@ class CommitPlan:
             entity_id = self._get_context().entity_id
             thread = self._get_context().thread
             init = self._get_context().init
-
-
 
             # Get the workspaces in this thread
             response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread)
@@ -445,8 +433,6 @@ class CommitPlan:
                 'output': 0
             }
 
-
-
         except Exception as e:
             print(f'Error in find_in_cache: {str(e)}')
             return {
@@ -479,8 +465,6 @@ class CommitPlan:
                 'error': pr,
                 'output': 0
             }
-
-
 
     def run(self, payload):
         action = 'run>commit_plan'
@@ -536,7 +520,6 @@ class CommitPlan:
 
         self._set_context(context)
 
-
         self.AGU = AgentUtilities(
             self.config,
             context.portfolio,
@@ -545,7 +528,6 @@ class CommitPlan:
             context.entity_id,
             context.thread
         )
-
 
         results = []
 
