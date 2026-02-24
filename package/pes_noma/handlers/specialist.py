@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import json
 import random
+import time
 
 class UniversalEncoder(json.JSONEncoder):
     """JSON encoder that handles Decimal, datetime, date, and other common types."""
@@ -119,6 +120,9 @@ class Specialist:
         else:
             arguments_dict = arguments
         params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
+        critical_keys = {"hint", "from_airport_code", "to_airport_code", "outbound_date", "return_date", "passengers", "destination", "origin", "hotel_name", "checkin", "checkout", "selection"}
+        critical_params = {k: v for k, v in arguments_dict.items() if k in critical_keys}
+        print(f"[SPECIALIST] Tool que precisa consentimento: {tool_name} | parametros_criticos={critical_params}")
 
         consent = {
             'commands':payload['tool_calls'],
@@ -239,6 +243,7 @@ class Specialist:
                 messages.append({ "role": "system", "content":f'In case you need them, the following tools are recommended to execute this action: {json.dumps(action_tools)}'})
 
                 approved_tools = [tool.strip() for tool in action_tools.split(',')]
+                print(f"[SPECIALIST] tools_disponiveis={approved_tools}")
 
             # Tools
             '''
@@ -369,6 +374,7 @@ class Specialist:
                 if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
+                    print(f"[SPECIALIST] interpret_result | action=tool_call | tool={selected_tool}")
 
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
                         #print(f'Interpret() >> Run this tool:{validated_result}') #legacy print
@@ -443,7 +449,8 @@ class Specialist:
                             msg = validated_result.get('content')
                             #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
                         else:
-                            print(f'Interpret() >> The agent is asking something to the user: {validated_result}') #else print
+                            #print(f'Interpret() >> The agent is asking something to the user: {validated_result}') #legacy print
+                            print(f"[SPECIALIST] interpret_result | action=message_to_user | content={str(validated_result.get('content', ''))[:140]}")
                             nonce = random.randint(100000, 999999)
                             c_id = f'{c_id_pre}:*:1:{nonce}'
                             msg = validated_result.get('content')
@@ -506,6 +513,9 @@ class Specialist:
             if isinstance(params, str):
                 params = json.loads(params)
             tid = command['tool_calls'][0]['id']
+            hidden_keys = {'_portfolio', '_org', '_entity_type', '_entity_id', '_thread', '_init', 'plan_id', 'plan_step', 'action_step', 'tool_step', 'continuity', 'workspace', 'state_machine'}
+            user_params = {k: v for k, v in params.items() if k not in hidden_keys}
+            print(f"[SPECIALIST] tool_start | tool={tool_name} | params={user_params}")
 
             #print(f'tid:{tid}') #legacy print
 
@@ -567,7 +577,7 @@ class Specialist:
             #print(f'Handler response:{response}') #Verboso
             response_clean = {k: v for k, v in response.items() if k not in ['stack', 'output']}
             response_clean['output_size'] = len(str(response.get('output', '')))
-            #print(f'Handler response (no stack/output):{response_clean}') #legacy print
+            print(f"[SPECIALIST] handler_response | tool={tool_name} | success={response.get('success')} | details={response_clean}")
 
             #raise Exception('Troubleshooting stop')
 
@@ -646,6 +656,7 @@ class Specialist:
 
             #print(f'message output: {tool_out}')
             print("✅ Tool execution complete.")
+            print(f"[SPECIALIST] tool_end | tool={tool_name} | success=True")
 
             return {"success": True, "function": function, "input": command, "output": tool_out}
 
@@ -668,7 +679,7 @@ class Specialist:
             self.AGU.mutate_workspace({'action_log': log_entry})
 
             error_result = {
-                "success": False, "action": action,"input": command,"output": str(e)
+                "success": False, "action": function,"input": command,"output": str(e)
             }
 
             return error_result
@@ -781,6 +792,7 @@ class Specialist:
             params['state_machine'] = workspace['state_machine'][continuity['plan_id']]
 
             response = self.SHC.handler_call(portfolio,org,parts[0],parts[1],params)
+            print(f"[VERIFY] called | action={action} | handler={verification_handler}")
 
             if response['success']:
                 msg = f"Verification OK. Step Completed."
@@ -796,6 +808,7 @@ class Specialist:
 
                 self.AGU.print_chat(msg,'transient')
                 #print(msg) #legacy print
+                print(f"[VERIFY] result=SUCCESS | stop_loop=True")
 
             else:
                 msg = f"Step has not been completed yet. Continue the loop"
@@ -808,6 +821,7 @@ class Specialist:
                 self.AGU.mutate_workspace({'action_log': log_entry})
                 # We don't need to record in action_log when verification is KO
                 #print(msg) #legacy print
+                print(f"[VERIFY] result=FAILED | stop_loop=False")
 
             return {"success": response['success'], "action": function, "input": "", "output": response['output']}
 
@@ -884,7 +898,7 @@ class Specialist:
         '''
 
         action = 'run > specialist'
-        #print(f'Running specialist:{payload}') #legacy print
+        print(f"[SPECIALIST] START | action={action} | step_id={payload.get('step_id')} | current_action={payload.get('action')} | inputs={payload.get('inputs', {})}")
 
         # Get context from AGU if available, otherwise create new
 
@@ -934,7 +948,7 @@ class Specialist:
             verification_result = ''
             while loops < loop_limit:
                 loops = loops + 1
-                #print(f'Loop iteration {loops}/{loop_limit}') #legacy print
+                print(f"[SPECIALIST] loop_start {loops}/{loop_limit}")
 
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
                 response_1 = self.interpret(tool_result=tool_result)
@@ -997,6 +1011,7 @@ class Specialist:
                         }
 
                         self.AGU.mutate_workspace({'action_log': log_entry})
+                        print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | verification=completed")
 
                 elif 'tool_calls' not in response_1['output'] or not response_1['output']['tool_calls']:
                     # No Tool needs execution.
@@ -1012,6 +1027,7 @@ class Specialist:
                     output = {
                         'status':'awaiting'
                     }
+                    print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | status=awaiting")
 
                     return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
 

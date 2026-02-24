@@ -301,7 +301,7 @@ class ExecutePlan:
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
 
         function = "execute_plan > run"
-        #print("Running:", function, payload) #legacy print
+        print(f"[EXECUTOR] START | function={function} | plan_id={payload.get('plan_id')} | step={payload.get('plan_step')} | action_step={payload.get('action_step', '')}")
 
         """
         Execute (or resume) the given plan.
@@ -355,6 +355,7 @@ class ExecutePlan:
 
                 step_id = str(step["step_id"])
                 step_title = step["title"]
+                print(f"[EXECUTOR] loop_start={loop} | step_id={step_id} | title={step_title}")
 
                 pr = f"@ step {step_id}:{step_title}"
                 #print(pr) #legacy print
@@ -443,6 +444,7 @@ class ExecutePlan:
                         'status':'running'
                     }
                     self.AGU.mutate_workspace({"step_state": step_status}) # Changes status of the current step
+                    print(f"[EXECUTOR] step_transition | step_id={step_id} | status=running")
 
                     # 1) Input Check
                     self._input_check(step)
@@ -490,6 +492,7 @@ class ExecutePlan:
                         }
                         self.AGU.mutate_workspace({"step_state": step_status})
                         print(f'Specialist returned failure for step {plan_id}:{step_id}')
+                        print(f"[EXECUTOR] step_transition | step_id={step_id} | status=failed")
                         # Continue to next step (or break if you want to stop on failure)
                         break
 
@@ -505,14 +508,15 @@ class ExecutePlan:
                         self.AGU.mutate_workspace({"step_state": step_status})
 
                         print(f'The specialist has declared that step {plan_id}:{step_id} is {status}')
+                        print(f"[EXECUTOR] step_transition | step_id={step_id} | status={status}")
 
                     if status == 'awaiting':
-                        print(f'The step has status {status}.') #legacy print
+                        print(f"[EXECUTOR] step_waiting | step_id={step_id} | status={status}")
                         # Breaking the loop to wait for answer from user. Loop will be regenerated with the Continuity id.
                         break
 
                     elif status == 'completed':
-                        print('Step has been finished, going to the next step in the plan') #legacy print
+                        print(f"[EXECUTOR] loop_end={loop} | step_id={step_id} | status=completed")
 
                 except Exception as e:
                     # Update step state and persist to state machine
