@@ -354,9 +354,36 @@ class ExecutePlan:
 
             
             print("Starting plan execution...")
+            
+            # Reorder steps to start from the target step indicated by continuity.
+            # This enables "jump to step" — the executor begins at the target and,
+            # once it completes, immediately returns to any paused/pending steps
+            # that were skipped (before the target), then continues with the rest.
+            # Order: target → steps before target → steps after target
+            target_step_id = continuity["plan_step"]
+            ordered_steps = []
+            before_target = []
+            after_target = []
+            target_found = False
+            for s in plan["steps"]:
+                if str(s["step_id"]) == str(target_step_id):
+                    target_found = True
+                    ordered_steps.append(s)  # Target step goes first
+                elif not target_found:
+                    before_target.append(s)  # Steps before target (likely paused)
+                else:
+                    after_target.append(s)   # Steps after target
+            # After the target, go back to the paused/pending steps first,
+            # then continue with the remaining steps after the target.
+            ordered_steps.extend(before_target)
+            ordered_steps.extend(after_target)
+            # Fallback: if target not found, use all steps (original behaviour)
+            if not ordered_steps:
+                ordered_steps = plan["steps"]
+            
             loop = 0
             # This is the plan_steps loop
-            for step in plan["steps"]:
+            for step in ordered_steps:
                 loop = loop+1
                 
                 step_id = str(step["step_id"]) 
@@ -401,11 +428,19 @@ class ExecutePlan:
                 
                 # Check if the step has a status that needs to be skipped
                 step_state = step_states_by_id[step_id]
-                if step_state["status"] in (
-                    "completed"
-                ):
+                if step_state["status"] == "completed":
                     print(f'Skipping step. Status:{step_state["status"]}')
                     continue
+                elif step_state["status"] == "paused":
+                    # Reactivate the paused step so it can be executed
+                    print(f'Reactivating paused step {step_id}')
+                    reactivate_status = {
+                        'plan_id': plan_id,
+                        'plan_step': step_id,
+                        'status': 'pending'
+                    }
+                    self.AGU.mutate_workspace({"step_state": reactivate_status})
+                    # Don't skip — fall through to execute this step
                  
 
                  
