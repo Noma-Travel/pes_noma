@@ -1608,6 +1608,41 @@ Travel request: {user_message}"""
         intent['party']['policies_by_id'] = policies_by_id
         return intent
 
+    def _inject_preferences_per_traveler(self, intent, traveler_ids, portfolio, org):
+        all_prefs = None  # fetch once, lazy
+        travelers_by_id = (intent.get('party') or {}).get('travelers_by_id') or {}
+        preferences_by_id = {}
+
+        for tid in traveler_ids:
+            if str(tid).startswith('t') and str(tid)[1:].isdigit():
+                continue
+            try:
+                if all_prefs is None:
+                    resp = self.DAC.get_a_b(portfolio, org, 'noma_travel_preferences')
+                    all_prefs = resp.get('items', []) if resp.get('success') else []
+
+                matches = [p for p in all_prefs if p.get('user_id') == tid]
+                if not matches:
+                    continue
+                matches.sort(key=lambda x: x.get('_modified', ''), reverse=True)
+                pref = matches[0]
+                pref_id = pref.get('_id')
+                if not pref_id:
+                    continue
+
+                if tid not in travelers_by_id:
+                    travelers_by_id[tid] = {}
+                travelers_by_id[tid]['preferences_id'] = pref_id
+                preferences_by_id[pref_id] = pref
+                print(f"[generate_plan] Preferences linked to traveler {tid}")
+
+            except Exception as e:
+                print(f"[generate_plan] _inject_preferences_per_traveler error for {tid}: {e}")
+
+        intent.setdefault('party', {})['travelers_by_id'] = travelers_by_id
+        intent['party']['preferences_by_id'] = preferences_by_id
+        return intent
+
     def _inject_policies_into_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
         Merge all traveler policies into intent.preferences and intent.constraints
@@ -2163,6 +2198,14 @@ Travel request: {user_message}"""
                 context.org,
             )
             intent = self._inject_policies_into_intent(intent)
+
+            # Step 1d: Attach each traveler's preferences
+            intent = self._inject_preferences_per_traveler(
+                intent,
+                resolved_ids,
+                context.portfolio,
+                context.org,
+            )
 
             self.AGU.mutate_workspace(
                 {'request_intent': intent},
