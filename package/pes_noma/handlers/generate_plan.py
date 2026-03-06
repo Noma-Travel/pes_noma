@@ -1556,6 +1556,168 @@ Travel request: {user_message}"""
         return intent
 
     # ────────────────────────────────────────────────────────────────────────────
+    # Policy resolution
+    # ────────────────────────────────────────────────────────────────────────────
+
+    def _inject_policies_per_traveler(
+        self,
+        intent: Dict[str, Any],
+        traveler_ids: List[str],
+        portfolio: str,
+        org: str,
+    ) -> Dict[str, Any]:
+        """
+        For each resolved traveler ID, fetch their policy from noma_travel_policy
+        and store policy_id reference in travelers_by_id. Unique policies go in policies_by_id.
+        """
+        policy_cache: Dict[str, Any] = {}
+        travelers_by_id: Dict[str, Any] = (intent.get('party') or {}).get('travelers_by_id') or {}
+        policies_by_id: Dict[str, Any] = {}
+
+        for tid in traveler_ids:
+            if str(tid).startswith('t') and str(tid)[1:].isdigit():
+                continue
+            try:
+                attendant = self.DAC.get_a_b_c(portfolio, org, 'noma_attendants', tid)
+                if not attendant or not attendant.get('_id'):
+                    continue
+
+                policy_id = attendant.get('policy_id')
+                if not policy_id:
+                    continue
+
+                if policy_id not in policy_cache:
+                    policy_doc = self.DAC.get_a_b_c(portfolio, org, 'noma_travel_policy', policy_id)
+                    policy_cache[policy_id] = policy_doc if (policy_doc and policy_doc.get('_id')) else None
+
+                policy = policy_cache[policy_id]
+                if not policy:
+                    continue
+
+                if tid not in travelers_by_id:
+                    travelers_by_id[tid] = {}
+                travelers_by_id[tid]['policy_id'] = policy_id
+                policies_by_id[policy_id] = policy
+
+                print(f"[generate_plan] Policy '{policy.get('name')}' ({policy_id}) linked to traveler {tid}")
+
+            except Exception as e:
+                print(f"[generate_plan] _inject_policies_per_traveler error for {tid}: {e}")
+
+        intent.setdefault('party', {})['travelers_by_id'] = travelers_by_id
+        intent['party']['policies_by_id'] = policies_by_id
+        return intent
+
+    def _inject_policies_into_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge all traveler policies into intent.preferences and intent.constraints
+        using the most-restrictive rule.
+        """
+        try:
+            party = intent.get('party') or {}
+            travelers_by_id = party.get('travelers_by_id') or {}
+            policies_by_id = party.get('policies_by_id') or {}
+
+            referenced_policy_ids = {
+                t['policy_id'] for t in travelers_by_id.values()
+                if isinstance(t, dict) and t.get('policy_id')
+            }
+            policies = [
+                policies_by_id[pid] for pid in referenced_policy_ids
+                if pid in policies_by_id and isinstance(policies_by_id[pid], dict)
+            ]
+            if not policies:
+                return intent
+        except Exception as e:
+            print(f"[generate_plan] _inject_policies_into_intent aborted: {e}")
+            return intent
+
+        FLIGHT_CLASS_ORDER = ['economy', 'premium_economy', 'business', 'first']
+
+        def most_restrictive_class(classes):
+            idxs = []
+            for c in classes:
+                try:
+                    idxs.append(FLIGHT_CLASS_ORDER.index(str(c).lower()))
+                except (ValueError, TypeError):
+                    pass
+            if not idxs:
+                return None
+            return FLIGHT_CLASS_ORDER[min(idxs)]
+
+        def min_val(key):
+            vals = []
+            for p in policies:
+                v = p.get(key)
+                if v is not None:
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            return min(vals) if vals else None
+
+        def all_bool(key):
+            vals = []
+            for p in policies:
+                v = p.get(key)
+                if v is not None:
+                    try:
+                        vals.append(bool(v))
+                    except (TypeError, ValueError):
+                        pass
+            return all(vals) if vals else None
+
+        def intersect_lists(key):
+            sets = []
+            for p in policies:
+                v = p.get(key)
+                if isinstance(v, list):
+                    sets.append(set(v))
+                elif isinstance(v, str) and v:
+                    sets.append({v})
+            if not sets:
+                return None
+            result = sets[0]
+            for s in sets[1:]:
+                result = result & s
+            return list(result)
+
+        try:
+            merged_class = most_restrictive_class([p.get('max_flight_class') for p in policies])
+            merged_flight_budget = min_val('max_flight_budget')
+            merged_hotel_stars = min_val('max_hotel_stars')
+            merged_hotel_rate = min_val('max_hotel_daily_rate')
+            merged_car_rental = all_bool('allowed_car_rental')
+            merged_services = intersect_lists('enabled_services')
+            currency = next((p['currency'] for p in policies if p.get('currency')), None)
+
+            flight_prefs = intent.setdefault('preferences', {}).setdefault('flight', {})
+            hotel_prefs = intent['preferences'].setdefault('hotel', {})
+            constraints = intent.setdefault('constraints', {})
+
+            if merged_class:
+                flight_prefs['max_class'] = merged_class
+            if merged_flight_budget is not None:
+                flight_prefs['max_budget'] = merged_flight_budget
+            if merged_hotel_stars is not None:
+                hotel_prefs['max_stars'] = merged_hotel_stars
+            if merged_hotel_rate is not None:
+                hotel_prefs['max_daily_rate'] = merged_hotel_rate
+            if merged_car_rental is not None:
+                constraints['allowed_car_rental'] = merged_car_rental
+            if merged_services is not None:
+                constraints['enabled_services'] = merged_services
+            if currency:
+                constraints['currency'] = currency
+
+            print(f"[generate_plan] Most-restrictive policy merged: class={merged_class}, flight_budget={merged_flight_budget}, hotel_stars={merged_hotel_stars}, hotel_rate={merged_hotel_rate}")
+        except Exception as e:
+            print(f"[generate_plan] _inject_policies_into_intent merge failed: {e}")
+            import traceback; traceback.print_exc()
+
+        return intent
+
+    # ────────────────────────────────────────────────────────────────────────────
 
     def _load_prompts(self, portfolio: str, org: str, prompt_ring: str = "pes_prompts", case_group: str = None) -> Dict[str, str]:
         """
@@ -1991,6 +2153,16 @@ Travel request: {user_message}"""
                 context.org,
             )
             print(f"[generate_plan] Intent after traveler resolution: traveler_ids={intent.get('party', {}).get('traveler_ids')}")
+
+            # Step 1c: Attach each traveler's policy into intent.party + merge most restrictive
+            resolved_ids = (intent.get('party') or {}).get('traveler_ids') or []
+            intent = self._inject_policies_per_traveler(
+                intent,
+                resolved_ids,
+                context.portfolio,
+                context.org,
+            )
+            intent = self._inject_policies_into_intent(intent)
 
             self.AGU.mutate_workspace(
                 {'request_intent': intent},
