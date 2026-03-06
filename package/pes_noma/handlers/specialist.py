@@ -13,6 +13,8 @@ import json
 import random
 import time
 
+from pes_noma.utils.preference_utils import get_all_traveler_preferences
+
 class UniversalEncoder(json.JSONEncoder):
     """JSON encoder that handles Decimal, datetime, date, and other common types."""
     def default(self, obj):
@@ -80,6 +82,7 @@ class RequestContext:
     continuity: Dict[str, Any] = field(default_factory=dict)
     message: str = ''
     tool_response_c_id: str = ''
+    traveler_preferences: Dict[str, Any] = field(default_factory=dict)
 
 # Create a context variable to store the request context
 request_context: ContextVar[RequestContext] = ContextVar('request_context', default=RequestContext())
@@ -227,6 +230,50 @@ class Specialist:
             # Message to answer questions from the belief system
             meta_instructions['answer_from_belief'] = "You can reason over the message history and known facts (beliefs) to answer user questions. If the user asks a question, check the history or beliefs before asking again."
 
+            # Build traveler preferences instruction
+            traveler_prefs = self._get_context().traveler_preferences
+            preferences_instruction = ''
+            if traveler_prefs:
+                pref_lines = []
+                for tid, pref in traveler_prefs.items():
+                    name = pref.get('user_name') or pref.get('name') or tid
+                    parts = []
+                    if pref.get('preferred_airlines'):
+                        parts.append(f"preferred airlines: {', '.join(pref['preferred_airlines'])}")
+                    if pref.get('seat_preference') and pref['seat_preference'] != 'No Preference':
+                        parts.append(f"seat: {pref['seat_preference']}")
+                    if pref.get('preferred_travel_time'):
+                        parts.append(f"preferred time: {pref['preferred_travel_time']}")
+                    if pref.get('blocked_travel_time'):
+                        parts.append(f"blocked times: {', '.join(pref['blocked_travel_time'])}")
+                    if pref.get('hotel_chain_pref'):
+                        parts.append(f"hotel chains: {', '.join(pref['hotel_chain_pref'])}")
+                    if pref.get('hotel_floor_pref'):
+                        parts.append(f"hotel floor: {pref['hotel_floor_pref']}")
+                    if pref.get('hotel_facilities'):
+                        parts.append(f"hotel facilities: {', '.join(pref['hotel_facilities'])}")
+                    if pref.get('is_smoker'):
+                        parts.append("smoker: yes")
+                    if pref.get('special_needs'):
+                        parts.append(f"special needs: {pref['special_needs']}")
+                    if pref.get('dietary_requirements'):
+                        parts.append(f"dietary: {pref['dietary_requirements']}")
+                    if pref.get('car_type_pref'):
+                        parts.append(f"car preference: {pref['car_type_pref']}")
+                    if pref.get('preferred_hotels_by_city'):
+                        for entry in pref['preferred_hotels_by_city']:
+                            city = entry.get('city', '')
+                            hotels = entry.get('hotels', [])
+                            if city and hotels:
+                                parts.append(f"preferred hotels in {city}: {', '.join(hotels)}")
+                    if parts:
+                        pref_lines.append(f"- {name}: {'; '.join(parts)}")
+                if pref_lines:
+                    preferences_instruction = (
+                        "TRAVELER PREFERENCES (use these to prioritize and filter options):\n"
+                        + '\n'.join(pref_lines)
+                    )
+
             # Message array
             messages = [
                 { "role": "system", "content": meta_instructions['opening_message']}, # META INSTRUCTIONS
@@ -238,6 +285,10 @@ class Specialist:
                 { "role": "system", "content": current_desire }, # CURRENT_DESIRE
 
             ]
+
+            # Inject traveler preferences if available
+            if preferences_instruction:
+                messages.append({ "role": "system", "content": preferences_instruction })
 
             # Add the incoming messages
             for msg in message_list:
@@ -965,6 +1016,15 @@ class Specialist:
             context.current_action = payload.get('action', '')
             context.continuity = payload.get('continuity',{}) # plan_id, plan_step, action_step, tool_id
 
+            # Load traveler preferences from workspace intent
+            try:
+                workspace = self.AGU.get_active_workspace()
+                intent = (workspace or {}).get('request_intent') or {}
+                context.traveler_preferences = get_all_traveler_preferences(intent)
+                if context.traveler_preferences:
+                    print(f"[specialist] Loaded preferences for {len(context.traveler_preferences)} traveler(s)")
+            except Exception as e:
+                print(f"[specialist] Could not load traveler preferences: {e}")
 
             # Set the initial context for this turn
             self._set_context(context)
