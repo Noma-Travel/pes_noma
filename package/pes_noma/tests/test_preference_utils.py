@@ -2,11 +2,15 @@
 Tests for preference_utils.py
 
 Run with:
-  python -m pytest extensions/pes_noma/package/pes_noma/utils/test_preference_utils.py -v
-  # or, sem pytest:
-  python extensions/pes_noma/package/pes_noma/utils/test_preference_utils.py
+  python -m pytest extensions/pes_noma/package/pes_noma/tests/test_preference_utils.py -v
 """
 import unittest
+import sys
+import os
+
+# Add pes_noma package to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from pes_noma.utils.preference_utils import (
     get_traveler_preference,
     get_all_traveler_preferences,

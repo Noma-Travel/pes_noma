@@ -27,3 +27,9 @@ packages = ["pes_noma", "pes_noma.handlers"]
 
 [tool.setuptools.package-data]
 pes_noma = ["blueprints/*.json"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+    "../../../noma/package",
+]
