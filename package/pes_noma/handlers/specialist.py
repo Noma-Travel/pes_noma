@@ -111,7 +111,166 @@ class Specialist:
             setattr(context, key, value)
         self._set_context(context)
 
+    def _summarize_plan(self, plan_data, state_data, current_step_id, workspace=None):
+        """
+        Sumariza o plano completo em texto, mostrando o status de cada step
+        e qual step está sendo executado no momento.
+        Similar à lógica do front-end em noma_loop.tsx
+        """
+        if not plan_data or not plan_data.get('steps'):
+            return "No plan available."
 
+        summary_lines = ["Plan Summary:"]
+
+        # Try to get intent information from cache
+        intent_info = None
+        if workspace:
+            cache = workspace.get('cache', {})
+            # Look for generate_plan result in cache
+            for key in cache.keys():
+                if 'generate_plan' in key:
+                    plan_cache = cache.get(key, {})
+                    intent_info = plan_cache.get('output', {}).get('intent', {})
+                    break
+
+        # Add trip-level information if available (only high-level info, not segments details)
+        if intent_info:
+            trip_type = intent_info.get('itinerary', {}).get('trip_type', 'unknown')
+            summary_lines.append(f"Trip Type: {trip_type}")
+
+            # Add hotel information if available
+            lodging = intent_info.get('itinerary', {}).get('lodging', {})
+            if lodging.get('needed', False):
+                check_in = lodging.get('check_in', 'N/A')
+                check_out = lodging.get('check_out', 'N/A')
+                location = lodging.get('location_hint', 'N/A')
+                if check_in != 'N/A' or check_out != 'N/A' or location != 'N/A':
+                    summary_lines.append(f"Hotel: Check-in {check_in}, Check-out {check_out}, Location: {location}")
+
+            # Flight segments: list all legs so the agent uses ALL of them when calling flight search tools
+            segments = intent_info.get('itinerary', {}).get('segments') or []
+            if segments:
+                summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
+                for i, seg in enumerate(segments):
+                    origin = (seg.get('origin') or {}).get('code') or seg.get('origin') or '?'
+                    dest = (seg.get('destination') or {}).get('code') or seg.get('destination') or '?'
+                    date = seg.get('depart_date') or seg.get('date') or '?'
+                    if isinstance(origin, dict):
+                        origin = origin.get('code', '?')
+                    if isinstance(dest, dict):
+                        dest = dest.get('code', '?')
+                    summary_lines.append(f"  Segment {i}: {origin} -> {dest} on {date}")
+                summary_lines.append("")
+
+            summary_lines.append("")
+
+        summary_lines.append(f"Total steps: {len(plan_data['steps'])}")
+        summary_lines.append("")
+
+        for step in plan_data['steps']:
+            step_id = str(step.get('step_id', ''))
+            step_title = step.get('title', f'Step {step_id}')
+            step_action = step.get('action', 'N/A')
+            step_inputs = step.get('inputs', {})
+
+            # Find corresponding state for this step
+            step_state = None
+            if state_data and state_data.get('steps'):
+                step_state = next(
+                    (s for s in state_data['steps'] if str(s.get('step_id', '')) == step_id),
+                    None
+                )
+
+            # Map status
+            status = "pending"
+            if step_state:
+                step_status = str(step_state.get('status', '')).lower()
+                if step_status in ['success', 'completed']:
+                    status = "completed"
+                elif step_status in ['failed', 'error']:
+                    status = "error"
+
+            # Mark current step
+            is_current = str(current_step_id) == step_id
+            current_marker = " [CURRENT]" if is_current else ""
+
+            # Build step line with action
+            status_symbol = "✓" if status == "completed" else "✗" if status == "error" else "○"
+            summary_lines.append(f"{status_symbol} Step {step_id}: {step_title} [{status}]{current_marker}")
+            summary_lines.append(f"  Action: {step_action}")
+
+            # Add detailed inputs
+            if step_inputs:
+                summary_lines.append("  Parameters:")
+                # Format inputs in a readable way
+                for key, value in step_inputs.items():
+                    if isinstance(value, list):
+                        value_str = ', '.join(str(v) for v in value)
+                    else:
+                        value_str = str(value)
+                    summary_lines.append(f"    - {key}: {value_str}")
+
+            # Add dependencies
+            depends_on = step.get('depends_on', [])
+            if depends_on:
+                summary_lines.append(f"  Depends on: {', '.join(str(d) for d in depends_on)}")
+
+            # Add sub-steps (tools/actions) if available
+            if step_state and step_state.get('action_log'):
+                action_log = step_state['action_log']
+                if isinstance(action_log, list):
+                    # Group by tool name (similar to front-end logic)
+                    tool_states = {}
+                    for log_entry in action_log:
+                        if not log_entry.get('type'):
+                            continue
+
+                        tool_name = log_entry.get('tool', '*')
+                        log_status = str(log_entry.get('status', ''))
+                        log_type = log_entry.get('type', '')
+
+                        # Determine entry status
+                        entry_status = "pending"
+                        if log_status == '5' or log_type == 'tool_ok':
+                            entry_status = "completed"
+                        elif log_status == '6' or log_type == 'error':
+                            entry_status = "error"
+
+                        # Keep latest state for each tool
+                        # Priority: completed (5) > error (6) > executing (4) > waiting (3) > request (0)
+                        if tool_name not in tool_states:
+                            tool_states[tool_name] = {
+                                'status': entry_status,
+                                'statusCode': log_status,
+                                'name': tool_name if tool_name != '*' else (log_entry.get('message', 'User interaction')[:50] or 'User interaction')
+                            }
+                        else:
+                            # Update if this entry represents a more advanced state
+                            current_status_code = tool_states[tool_name]['statusCode']
+                            should_update = (
+                                log_status == '5' or  # Completed is always the most advanced
+                                (log_status == '6' and entry_status == "error" and tool_states[tool_name]['status'] != "completed") or  # Error overrides pending states
+                                (log_status == '4' and (current_status_code == '3' or current_status_code == '0' or not current_status_code)) or  # Executing (4) overrides waiting (3) or request (0)
+                                (log_status == '3' and current_status_code == '0' and tool_states[tool_name]['statusCode'] != '4')  # Waiting (3) overrides request (0) if we haven't seen executing yet
+                            )
+
+                            if should_update:
+                                tool_states[tool_name] = {
+                                    'status': entry_status,
+                                    'statusCode': log_status,
+                                    'name': tool_name if tool_name != '*' else (log_entry.get('message', 'User interaction')[:50] or 'User interaction')
+                                }
+
+                    # Add sub-steps to summary
+                    if tool_states:
+                        summary_lines.append("  Tools executed:")
+                        for tool_name, tool_state in tool_states.items():
+                            sub_status_symbol = "✓" if tool_state['status'] == "completed" else "✗" if tool_state['status'] == "error" else "○"
+                            summary_lines.append(f"    {sub_status_symbol} {tool_state['name']} [{tool_state['status']}]")
+
+            summary_lines.append("")  # Empty line between steps
+
+        return "\n".join(summary_lines)
 
     def consent_form(self,payload):
         function = 'consent_form'
@@ -176,9 +335,9 @@ class Specialist:
                 step_number = int(continuity["plan_step"])
                 intro_msg = {'role':'assistant','content':f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'}
                 c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
-                self.AGU.save_chat(intro_msg, next = c_id)
+                #self.AGU.save_chat(intro_msg, next = c_id)
                 #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
-                message_list['output'].append(intro_msg)
+                #message_list['output'].append(intro_msg)
 
             # Go through the message_list and replace the value of the 'content' attribute with an empty object when the role is 'tool'
             # Unless the last message it a tool response which the interpret function needs to process.
@@ -233,11 +392,26 @@ class Specialist:
                 { "role": "system", "content": meta_instructions['current_time']}, # CURRENT TIME
                 { "role": "system", "content": action_instructions}, # CURRENT ACTIONS
                 { "role": "system", "content": optimal_path_instructions}, # OPTIMAL PATH INSTRUCTIONS
-                { "role": "system", "content": meta_instructions['answer_from_belief']},
-                { "role": "system", "content": belief_str }, # BELIEF SYSTEM
+                # { "role": "system", "content": meta_instructions['answer_from_belief']},
+                # { "role": "system", "content": belief_str }, # BELIEF SYSTEM
                 { "role": "system", "content": current_desire }, # CURRENT_DESIRE
 
             ]
+
+            # Add plan summary
+            try:
+                workspace = self.AGU.get_active_workspace()
+                plan_id = continuity.get('plan_id', '')
+                current_step_id = continuity.get('plan_step', '')
+
+                if workspace and plan_id and plan_id in workspace.get('plan', {}):
+                    plan_data = workspace['plan'][plan_id]
+                    state_data = workspace.get('state_machine', {}).get(plan_id, {})
+                    plan_summary = self._summarize_plan(plan_data, state_data, current_step_id, workspace)
+                    messages.append({ "role": "system", "content": plan_summary })
+            except Exception as e:
+                print(f"Error generating plan summary: {e}")
+                # Continue without plan summary if there's an error
 
             # Add the incoming messages
             for msg in message_list:
@@ -293,19 +467,34 @@ class Specialist:
                         dict_params = {}
                         required_params = []
 
-                        # Handle new format: array of objects with name, hint, required
+                        # Handle new format: array of objects with name, hint, required; optional type "array" with elements/items
                         if isinstance(tool_input, list):
                             for param in tool_input:
-                                if isinstance(param, dict) and 'name' in param and 'hint' in param:
-                                    param_name = param['name']
-                                    param_hint = param['hint']
-                                    param_required = param.get('required', False)
-
+                                if not isinstance(param, dict) or 'name' not in param:
+                                    continue
+                                param_name = param['name']
+                                param_required = param.get('required', False)
+                                # Generic: type "array" with elements or items -> build array property
+                                if param.get('type') == 'array' and (param.get('elements') or param.get('items')):
+                                    items_schema = param.get('elements') or param.get('items')
+                                    prop = {
+                                        'type': 'array',
+                                        'description': param.get('hint') or param.get('description', ''),
+                                        'items': items_schema
+                                    }
+                                    if 'minItems' in param:
+                                        prop['minItems'] = param['minItems']
+                                    if 'maxItems' in param:
+                                        prop['maxItems'] = param['maxItems']
+                                    dict_params[param_name] = prop
+                                    if param_required:
+                                        required_params.append(param_name)
+                                else:
+                                    # Default: string property (backward compatible)
                                     dict_params[param_name] = {
                                         'type': 'string',
-                                        'description': param_hint
+                                        'description': param.get('hint', '')
                                     }
-
                                     if param_required:
                                         required_params.append(param_name)
                         # Handle old format for backward compatibility
@@ -334,14 +523,20 @@ class Specialist:
                         #print(f'List Tools:{list_tools}')
 
 
+            # Salva o messages e o list_tools em arquivos JSON separados para leitura
+            with open('prompt_messages.json', 'w', encoding='utf-8') as msg_file:
+                json.dump(messages, msg_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
+            with open('prompt_tools.json', 'w', encoding='utf-8') as tools_file:
+                json.dump(list_tools, tools_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
+
             # Prompt
             prompt = {
-                    "model": self.AGU.AI_1_MODEL,
-                    "messages": messages,
-                    "tools": list_tools,
-                    "temperature":0,
-                    "tool_choice": "auto"
-                }
+                "model": self.AGU.AI_1_MODEL,
+                "messages": messages,
+                "tools": list_tools,
+                "temperature": 0,
+                "tool_choice": "auto"
+            }
 
 
             prompt = self.AGU.sanitize(prompt)
