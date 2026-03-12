@@ -1559,6 +1559,137 @@ Travel request: {user_message}"""
 
         return intent
 
+    def _inject_policies_per_traveler(
+        self,
+        intent: Dict[str, Any],
+        traveler_ids: List[str],
+        portfolio: str,
+        org: str,
+    ) -> Dict[str, Any]:
+        policy_cache: Dict[str, Any] = {}
+        travelers_by_id: Dict[str, Any] = (intent.get('party') or {}).get('travelers_by_id') or {}
+        policies_by_id: Dict[str, Any] = {}
+
+        for tid in traveler_ids:
+            if str(tid).startswith('t') and str(tid)[1:].isdigit():
+                continue
+            try:
+                attendant = self.DAC.get_a_b_c(portfolio, org, 'noma_attendants', tid)
+                if not attendant or not attendant.get('_id'):
+                    continue
+                policy_id = attendant.get('policy_id')
+                if not policy_id:
+                    continue
+                if policy_id not in policy_cache:
+                    policy_doc = self.DAC.get_a_b_c(portfolio, org, 'noma_travel_policy', policy_id)
+                    policy_cache[policy_id] = policy_doc if (policy_doc and policy_doc.get('_id')) else None
+                policy = policy_cache[policy_id]
+                if not policy:
+                    continue
+                if tid not in travelers_by_id:
+                    travelers_by_id[tid] = {}
+                travelers_by_id[tid]['policy_id'] = policy_id
+                policies_by_id[policy_id] = policy
+                print(f"[generate_plan] Policy '{policy.get('name')}' ({policy_id}) linked to traveler {tid}")
+            except Exception as e:
+                print(f"[generate_plan] _inject_policies_per_traveler error for {tid}: {e}")
+
+        intent.setdefault('party', {})['travelers_by_id'] = travelers_by_id
+        intent['party']['policies_by_id'] = policies_by_id
+        return intent
+
+    def _inject_policies_into_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            party = intent.get('party') or {}
+            travelers_by_id = party.get('travelers_by_id') or {}
+            policies_by_id = party.get('policies_by_id') or {}
+
+            referenced_policy_ids = {
+                t['policy_id'] for t in travelers_by_id.values()
+                if isinstance(t, dict) and t.get('policy_id')
+            }
+            policies = [
+                policies_by_id[pid] for pid in referenced_policy_ids
+                if pid in policies_by_id and isinstance(policies_by_id[pid], dict)
+            ]
+            if not policies:
+                return intent
+        except Exception as e:
+            print(f"[generate_plan] _inject_policies_into_intent aborted: {e}")
+            return intent
+
+        FLIGHT_CLASS_ORDER = ['economy', 'premium_economy', 'business', 'first']
+
+        def most_restrictive_class(classes):
+            idxs = []
+            for c in classes:
+                try:
+                    idxs.append(FLIGHT_CLASS_ORDER.index(str(c).lower()))
+                except (ValueError, TypeError):
+                    pass
+            return FLIGHT_CLASS_ORDER[min(idxs)] if idxs else None
+
+        def min_val(key):
+            vals = [float(p[key]) for p in policies if p.get(key) is not None]
+            return min(vals) if vals else None
+
+        try:
+            flight_prefs = intent.setdefault('preferences', {}).setdefault('flight', {})
+            hotel_prefs = intent['preferences'].setdefault('hotel', {})
+            constraints = intent.setdefault('constraints', {})
+
+            merged_class = most_restrictive_class([p.get('max_flight_class') for p in policies])
+            merged_flight_budget = min_val('max_flight_budget')
+            merged_hotel_stars = min_val('max_hotel_stars')
+            merged_hotel_rate = min_val('max_hotel_daily_rate')
+
+            if merged_class:
+                flight_prefs['max_class'] = merged_class
+            if merged_flight_budget is not None:
+                flight_prefs['max_budget'] = merged_flight_budget
+            if merged_hotel_stars is not None:
+                hotel_prefs['max_stars'] = merged_hotel_stars
+            if merged_hotel_rate is not None:
+                hotel_prefs['max_daily_rate'] = merged_hotel_rate
+
+            print(f"[generate_plan] Policy merged into intent: hotel_rate={merged_hotel_rate}, hotel_stars={merged_hotel_stars}")
+        except Exception as e:
+            print(f"[generate_plan] _inject_policies_into_intent merge failed: {e}")
+
+        return intent
+
+    def _inject_preferences_per_traveler(self, intent, traveler_ids, portfolio, org):
+        all_prefs = None
+        travelers_by_id = (intent.get('party') or {}).get('travelers_by_id') or {}
+        preferences_by_id = {}
+
+        for tid in traveler_ids:
+            if str(tid).startswith('t') and str(tid)[1:].isdigit():
+                continue
+            try:
+                if all_prefs is None:
+                    resp = self.DAC.get_a_b(portfolio, org, 'noma_travel_preferences')
+                    all_prefs = resp.get('items', []) if resp.get('success') else []
+                matches = [p for p in all_prefs if p.get('user_id') == tid]
+                if not matches:
+                    continue
+                matches.sort(key=lambda x: x.get('_modified', ''), reverse=True)
+                pref = matches[0]
+                pref_id = pref.get('_id')
+                if not pref_id:
+                    continue
+                if tid not in travelers_by_id:
+                    travelers_by_id[tid] = {}
+                travelers_by_id[tid]['preferences_id'] = pref_id
+                preferences_by_id[pref_id] = pref
+                print(f"[generate_plan] Preferences linked to traveler {tid}")
+            except Exception as e:
+                print(f"[generate_plan] _inject_preferences_per_traveler error for {tid}: {e}")
+
+        intent.setdefault('party', {})['travelers_by_id'] = travelers_by_id
+        intent['party']['preferences_by_id'] = preferences_by_id
+        return intent
+
     # ────────────────────────────────────────────────────────────────────────────
 
     def _load_prompts(self, portfolio: str, org: str, prompt_ring: str = "pes_prompts", case_group: str = None) -> Dict[str, str]:
@@ -1986,6 +2117,17 @@ Travel request: {user_message}"""
                                        facts=retrieved.get('facts', []), skills=retrieved.get('skills', []))
             if not intent:
                 return {'success': False, 'function': function, 'input': payload, 'output': 'Intent could not be extracted'}
+
+            # Resolve traveler names → real attendant IDs
+            intent = self._resolve_traveler_ids_in_intent(
+                intent, user_message, context.portfolio, context.org
+            )
+
+            # Inject policies and preferences per resolved traveler
+            resolved_ids = (intent.get('party') or {}).get('traveler_ids') or []
+            intent = self._inject_policies_per_traveler(intent, resolved_ids, context.portfolio, context.org)
+            intent = self._inject_policies_into_intent(intent)
+            intent = self._inject_preferences_per_traveler(intent, resolved_ids, context.portfolio, context.org)
 
             self.AGU.mutate_workspace(
                 {'request_intent': intent},
