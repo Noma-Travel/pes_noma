@@ -151,6 +151,7 @@ class Specialist:
             segments = intent_info.get('itinerary', {}).get('segments') or []
             if segments:
                 summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
+                legs_array = []
                 for i, seg in enumerate(segments):
                     origin = (seg.get('origin') or {}).get('code') or seg.get('origin') or '?'
                     dest = (seg.get('destination') or {}).get('code') or seg.get('destination') or '?'
@@ -160,6 +161,14 @@ class Specialist:
                     if isinstance(dest, dict):
                         dest = dest.get('code', '?')
                     summary_lines.append(f"  Segment {i}: {origin} -> {dest} on {date}")
+                    if origin != '?' and dest != '?' and date != '?':
+                        legs_array.append({"origin": origin, "destination": dest, "date": date})
+                if legs_array:
+                    summary_lines.append("")
+                    summary_lines.append("For search_flights_rextur, set the 'legs' parameter to exactly this array (copy it as-is):")
+                    summary_lines.append(json.dumps(legs_array))
+                    summary_lines.append("Use the above legs unless the user explicitly asks for something else (e.g. different dates or segments). The 'leg' parameter (0, 1, ...) only indicates which leg you are quoting in this step; 'legs' must always be the full list above.")
+                    summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. The only case where 'legs' should have a single item is when the plan has only one flight (one-way trip).")
                 summary_lines.append("")
 
             summary_lines.append("")
@@ -398,7 +407,7 @@ class Specialist:
 
             ]
 
-            # Add plan summary
+            # Add plan summary (includes dynamic legs for search_flights_rextur in the prompt text)
             try:
                 workspace = self.AGU.get_active_workspace()
                 plan_id = continuity.get('plan_id', '')
@@ -531,7 +540,7 @@ class Specialist:
 
             # Prompt
             prompt = {
-                "model": self.AGU.AI_1_MODEL,
+                "model": self.AGU.AI_2_MODEL,
                 "messages": messages,
                 "tools": list_tools,
                 "temperature": 0,
