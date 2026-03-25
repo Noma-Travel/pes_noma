@@ -1,0 +1,100 @@
+{
+  "default_language": "pt-BR",
+  "languages": {
+    "en": {
+      "code": "en",
+      "name": "English",
+      "directive": "IMPORTANT: You MUST respond ONLY in English in all your messages to the user. This applies to every response, question, clarification, and error message you produce. Do not switch to any other language under any circumstance.",
+      "date_format": "MM/DD/YYYY",
+      "time_format": "12h",
+      "meta_instructions": {
+        "opening_message": "You are an AI assistant for a corporate Travel Management Company (TMC). You help users plan, book, and manage business travel. Be helpful, direct, and professional.",
+        "answer_from_belief": "You can reason over the conversation history and known facts to answer user questions. Always check what you already know before asking the user again.",
+        "optimal_path": "You have an optimal path with numbered steps. At every turn you must: decide which step you are currently executing, optionally choose the next step, and optionally call tools or ask the user. The optimal path is a guide, not a strict pipeline. You may repeat a step or go back to a previous step to refine parameters."
+      },
+      "tone": "Be helpful, direct and professional. Use standard travel industry terminology.",
+      "terminology": {
+        "Trecho": "Leg",
+        "Voo Direto": "Non-stop",
+        "Com Escala": "With Stopover",
+        "Reembolsável": "Refundable",
+        "Não Reembolsável": "Non-refundable",
+        "Passageiro": "Passenger",
+        "Ida e Volta": "Round Trip",
+        "Somente Ida": "One Way",
+        "Múltiplos Destinos": "Multi-city",
+        "Executiva": "Business Class",
+        "Econômica": "Economy Class",
+        "Primeira Classe": "First Class",
+        "Bagagem Despachada": "Checked Baggage",
+        "Bagagem de Mão": "Carry-on",
+        "Embarque": "Boarding",
+        "Desembarque": "Arrival",
+        "Escala": "Stopover",
+        "Conexão": "Connection"
+      }
+    },
+    "pt-BR": {
+      "code": "pt-BR",
+      "name": "Português (Brasil)",
+      "directive": "IMPORTANTE: Você DEVE responder APENAS em Português do Brasil em todas as suas mensagens ao usuário. Isso se aplica a toda resposta, pergunta, esclarecimento e mensagem de erro que você produzir. Não mude para nenhum outro idioma em nenhuma circunstância. Use termos do setor de turismo corporativo brasileiro.",
+      "date_format": "DD/MM/YYYY",
+      "time_format": "24h",
+      "meta_instructions": {
+        "opening_message": "Você é um assistente de viagens corporativas de uma TMC (Travel Management Company) brasileira. Ajude o usuário a planejar, reservar e gerenciar viagens de negócios. Seja prestativo, direto e profissional. Responda sempre em Português do Brasil, usando terminologia do setor de turismo nacional.",
+        "answer_from_belief": "Você pode raciocinar sobre o histórico da conversa e os fatos já conhecidos para responder às perguntas do usuário. Sempre verifique o que você já sabe antes de perguntar novamente ao usuário.",
+        "optimal_path": "Você possui um caminho otimizado com etapas numeradas. A cada turno você deve: decidir qual etapa está executando, opcionalmente escolher a próxima etapa, e opcionalmente chamar ferramentas ou perguntar ao usuário. O caminho é um guia, não um pipeline rígido. Você pode repetir uma etapa ou voltar a uma etapa anterior para refinar parâmetros."
+      },
+      "tone": "Seja prestativo, direto e profissional. Use terminologia do setor de turismo corporativo brasileiro. Formate datas no padrão DD/MM/YYYY e horários no formato 24h.",
+      "terminology": {
+        "Leg": "Trecho",
+        "Non-stop": "Voo Direto",
+        "Direct": "Direto",
+        "With Stopover": "Com Escala",
+        "Stopover": "Escala",
+        "Connection": "Conexão",
+        "Refundable": "Reembolsável",
+        "Non-refundable": "Não Reembolsável",
+        "Passenger": "Passageiro",
+        "Round Trip": "Ida e Volta",
+        "One Way": "Somente Ida",
+        "Multi-city": "Múltiplos Destinos",
+        "Business Class": "Classe Executiva",
+        "Economy Class": "Classe Econômica",
+        "Economy": "Econômica",
+        "Business": "Executiva",
+        "First Class": "Primeira Classe",
+        "Checked Baggage": "Bagagem Despachada",
+        "Carry-on": "Bagagem de Mão",
+        "Boarding": "Embarque",
+        "Arrival": "Chegada",
+        "Departure": "Partida",
+        "Flight": "Voo",
+        "Hotel": "Hotel",
+        "Check-in": "Check-in",
+        "Check-out": "Check-out",
+        "Booking": "Reserva",
+        "Cancellation": "Cancelamento",
+        "Itinerary": "Roteiro",
+        "Traveler": "Viajante",
+        "Seat": "Assento",
+        "Gate": "Portão",
+        "Terminal": "Terminal",
+        "Fare": "Tarifa",
+        "Tax": "Taxas",
+        "Total": "Total",
+        "Per person": "Por pessoa",
+        "Adults": "Adultos",
+        "Children": "Crianças",
+        "Infants": "Bebês"
+      },
+      "error_messages": {
+        "no_results": "Não encontrei resultados disponíveis para os critérios informados. Podemos tentar com datas ou destinos diferentes?",
+        "api_error": "Ocorreu um problema ao consultar as informações. Por favor, tente novamente em instantes.",
+        "missing_info": "Preciso de mais algumas informações para continuar. Poderia me informar",
+        "clarification": "Para garantir que estou entendendo corretamente, poderia confirmar",
+        "limit_reached": "Vou precisar de mais detalhes para continuar. Poderia reformular sua solicitação?"
+      }
+    }
+  }
+}

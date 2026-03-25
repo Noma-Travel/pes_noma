@@ -2,6 +2,7 @@
 from renglo.data.data_controller import DataController
 from renglo.schd.schd_controller import SchdController
 from renglo.common import load_config
+from pes_noma.handlers.prompt_manager import PromptManager
 
 from openai import OpenAI
 from datetime import datetime
@@ -373,38 +374,17 @@ class Specialist:
                         action_tools = a['tools_reference']
                     break
 
-            # Optimal Path
-            optimal_path_instructions = (
-                "You have an optimal_path with numbered steps. At every turn, you must:\n"
-                "Decide which step you are currently executing (current_step_id).\n"
-                "Optionally choose the next step you want to move to (next_step_id).\n"
-                "Optionally call tools or ask the user.\n"
-                "The optimal path is a guide, not a strict pipeline. You may:\n"
-                "- Repeat a step (e.g., go from step 1 back to step 1),\n"
-                "- Go back to previous steps (e.g., from step 3 to step 1) if you need to refine parameters."
-            )
+            # Language-aware system prefix (directive, opening, current time, tone)
+            pm = PromptManager(config=self.config)
+            messages = pm.build_system_prefix(current_time=current_time)
 
-
-
-            # Meta Instructions
-            meta_instructions = {}
-            # Initial instructions
-            meta_instructions['opening_message'] = "You are an AI assistant. You can reason over conversation history, beliefs, and goals."
-            # Provide the current time
-            meta_instructions['current_time'] = f'The current time is: {current_time}'
-            # Message to answer questions from the belief system
-            meta_instructions['answer_from_belief'] = "You can reason over the message history and known facts (beliefs) to answer user questions. If the user asks a question, check the history or beliefs before asking again."
-
-            # Message array
-            messages = [
-                { "role": "system", "content": meta_instructions['opening_message']}, # META INSTRUCTIONS
-                { "role": "system", "content": meta_instructions['current_time']}, # CURRENT TIME
+            # Action-specific instructions and plan context
+            messages += [
                 { "role": "system", "content": action_instructions}, # CURRENT ACTIONS
-                { "role": "system", "content": optimal_path_instructions}, # OPTIMAL PATH INSTRUCTIONS
+                { "role": "system", "content": pm.get_optimal_path_instruction()}, # OPTIMAL PATH INSTRUCTIONS
                 # { "role": "system", "content": meta_instructions['answer_from_belief']},
                 # { "role": "system", "content": belief_str }, # BELIEF SYSTEM
                 { "role": "system", "content": current_desire }, # CURRENT_DESIRE
-
             ]
 
             # Add plan summary (includes dynamic legs for search_flights_rextur in the prompt text)
