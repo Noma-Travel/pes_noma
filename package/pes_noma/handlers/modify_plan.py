@@ -176,6 +176,7 @@ class IntentModifier:
         prompt = prompt.replace("#now_date#", datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d"))
         prompt = prompt.replace("#modification_examples#", modification_examples)
         data = self._get_llm().complete_json(prompt)
+        print(f'IntentModifier delta: {json.dumps(data, default=str)}')
         if not data or not isinstance(data.get("changes"), list):
             return None
         return data
@@ -209,12 +210,15 @@ class IntentModifier:
 
 You are a trip modification analyzer. Given the EXISTING INTENT and USER CORRECTION, output a structured delta describing ONLY what changed. Do NOT return the full intent.
 
+IMPORTANT: Only output changes that the user EXPLICITLY requested. Do NOT invent changes the user did not ask for.
+
 Time context: Today is #now_date#. Use YYYY-MM-DD for dates.
 
 CHANGE TYPES:
-- extend_stay: User wants to stay longer. Use until_date (new check_out) or add_nights.
-- shorten_stay: User wants to leave earlier. Use until_date or remove_nights.
-- add_side_trip: "Add X nights in [City]", "stop in [City] before going home" = add city BEFORE return. Use city (IATA) and nights.
+- extend_stay: User wants to stay longer. Use total_nights (absolute number of nights) when the user specifies a specific number, until_date (new check_out date) when specifying a date, or add_nights (extra nights to add) when specifying how many more nights.
+- shorten_stay: User wants to leave earlier. Use total_nights (absolute number of nights) when the user specifies a specific number, until_date (new check_out date) when specifying a date, or remove_nights (nights to remove).
+- add_side_trip: "Add X nights in [City]", "stop in [City] before going home" = add a NEW city BEFORE return. Use city (IATA) and nights. Only use this when the user mentions a DIFFERENT city than the current destination.
+- add_hotel: User wants to add a hotel stay at the destination they are already visiting. Use city (IATA code of the destination) and nights (number of nights; if not specified, infer from the trip duration).
 - change_dates: User changes departure or return. Use departure_date and/or return_date.
 
 SIMILAR INTENTS (canonical examples):
@@ -226,17 +230,20 @@ EXISTING INTENT:
 USER CORRECTION:
 #user_correction#
 
-Return ONLY valid JSON:
+Return ONLY valid JSON with ONLY the changes the user asked for:
 {
   "changes": [
     {"type": "extend_stay", "until_date": "YYYY-MM-DD"},
-    {"type": "add_side_trip", "city": "LAS", "nights": 2},
+    {"type": "extend_stay", "total_nights": 5},
+    {"type": "add_hotel", "city": "IATA", "nights": 3},
+    {"type": "add_side_trip", "city": "IATA", "nights": 2},
     {"type": "change_dates", "departure_date": "YYYY-MM-DD", "return_date": "YYYY-MM-DD"}
   ]
 }
 """
 
     def _apply_change(self, intent: Dict[str, Any], change: Dict[str, Any], now_date: str) -> None:
+        print(f'Applying change: {change}')
         ctype = change.get("type")
         if ctype == "extend_stay":
             self._apply_extend_stay(intent, change, now_date)
@@ -244,49 +251,138 @@ Return ONLY valid JSON:
             self._apply_shorten_stay(intent, change, now_date)
         elif ctype == "add_side_trip":
             self._apply_add_side_trip(intent, change, now_date)
+        elif ctype == "add_hotel":
+            self._apply_add_hotel(intent, change, now_date)
         elif ctype == "change_dates":
             self._apply_change_dates(intent, change, now_date)
 
     def _apply_extend_stay(self, intent: Dict[str, Any], change: Dict[str, Any], now_date: str) -> None:
         until = _clamp_date_mod(change.get("until_date"), now_date)
         add_nights = change.get("add_nights")
+        total_nights = change.get("total_nights")
         lod = intent.setdefault("itinerary", {}).setdefault("lodging", {})
         stays = lod.get("stays") or []
+        segs = intent.get("itinerary", {}).get("segments") or []
+        # Determine the base check-in date (from stays or from first outbound segment)
+        base_checkin = None
+        if stays and stays[0].get("check_in"):
+            base_checkin = stays[0].get("check_in")
+        elif segs:
+            base_checkin = segs[0].get("depart_date")
+        # Case 1: total_nights provided (absolute) — compute until_date from base
+        if total_nights is not None and base_checkin:
+            ci_dt = _parse_date_mod(base_checkin)
+            if ci_dt:
+                new_co = (ci_dt + timedelta(days=int(total_nights))).strftime("%Y-%m-%d")
+                until = _clamp_date_mod(new_co, now_date)
+                lod["number_of_nights"] = int(total_nights)
+        # Case 2: until_date provided
         if until:
             for s in stays:
                 s["check_out"] = until
             if lod.get("check_out"):
                 lod["check_out"] = until
-            if add_nights is not None:
-                lod["number_of_nights"] = (lod.get("number_of_nights") or 0) + int(add_nights)
+            # Recalculate number_of_nights from date spread
+            if base_checkin and total_nights is None:
+                ci_dt = _parse_date_mod(base_checkin)
+                until_dt = _parse_date_mod(until)
+                if ci_dt and until_dt:
+                    lod["number_of_nights"] = max(1, (until_dt - ci_dt).days)
+            self._update_return_segments_depart_date(intent, until)
+        # Case 3: only add_nights provided (relative, no until_date)
         elif add_nights is not None:
             add_n = int(add_nights)
-            last_co = None
-            for s in stays:
-                co = _parse_date_mod(s.get("check_out"))
-                if co and (last_co is None or co > last_co):
-                    last_co = co
-            if last_co:
-                new_co = (last_co + timedelta(days=add_n)).strftime("%Y-%m-%d")
-                new_co = _clamp_date_mod(new_co, now_date)
-                for s in stays:
-                    s["check_out"] = new_co
-                if lod.get("check_out"):
-                    lod["check_out"] = new_co
-        ret_date = until or (stays[-1].get("check_out") if stays else None)
-        if ret_date:
-            self._update_return_segments_depart_date(intent, ret_date)
+            current_nights = lod.get("number_of_nights") or 0
+            lod["number_of_nights"] = current_nights + add_n
+            # Compute new return date from base_checkin + new total
+            if base_checkin:
+                ci_dt = _parse_date_mod(base_checkin)
+                if ci_dt:
+                    new_co = (ci_dt + timedelta(days=current_nights + add_n)).strftime("%Y-%m-%d")
+                    new_co = _clamp_date_mod(new_co, now_date)
+                    for s in stays:
+                        s["check_out"] = new_co
+                    if lod.get("check_out"):
+                        lod["check_out"] = new_co
+                    self._update_return_segments_depart_date(intent, new_co)
 
     def _apply_shorten_stay(self, intent: Dict[str, Any], change: Dict[str, Any], now_date: str) -> None:
         until = _clamp_date_mod(change.get("until_date"), now_date)
+        total_nights = change.get("total_nights")
         lod = intent.setdefault("itinerary", {}).setdefault("lodging", {})
         stays = lod.get("stays") or []
+        segs = intent.get("itinerary", {}).get("segments") or []
+        base_checkin = None
+        if stays and stays[0].get("check_in"):
+            base_checkin = stays[0].get("check_in")
+        elif segs:
+            base_checkin = segs[0].get("depart_date")
+        if total_nights is not None and base_checkin:
+            ci_dt = _parse_date_mod(base_checkin)
+            if ci_dt:
+                new_co = (ci_dt + timedelta(days=int(total_nights))).strftime("%Y-%m-%d")
+                until = _clamp_date_mod(new_co, now_date)
+                lod["number_of_nights"] = int(total_nights)
         if until:
             for s in stays:
                 s["check_out"] = until
             if lod.get("check_out"):
                 lod["check_out"] = until
+            if base_checkin and total_nights is None:
+                ci_dt = _parse_date_mod(base_checkin)
+                until_dt = _parse_date_mod(until)
+                if ci_dt and until_dt:
+                    lod["number_of_nights"] = max(1, (until_dt - ci_dt).days)
             self._update_return_segments_depart_date(intent, until)
+
+    def _apply_add_hotel(self, intent: Dict[str, Any], change: Dict[str, Any], now_date: str) -> None:
+        """Add a hotel stay at the existing destination when lodging.stays is empty."""
+        city = (change.get("city") or "").upper()[:3]
+        nights = change.get("nights")
+        iti = intent.setdefault("itinerary", {})
+        lod = iti.setdefault("lodging", {})
+        segs = iti.get("segments") or []
+        if not segs:
+            return
+        if not city:
+            dest = segs[0].get("destination") or {}
+            city = (dest.get("code") if isinstance(dest, dict) else dest) or ""
+        if not city:
+            return
+        outbound_date = segs[0].get("depart_date")
+        return_seg = segs[-1] if len(segs) > 1 else None
+        return_date = return_seg.get("depart_date") if return_seg else None
+        if nights is None:
+            if outbound_date and return_date:
+                ci_dt = _parse_date_mod(outbound_date)
+                co_dt = _parse_date_mod(return_date)
+                if ci_dt and co_dt:
+                    nights = max(1, (co_dt - ci_dt).days)
+            if nights is None:
+                nights = lod.get("number_of_nights") or 3
+        nights = int(nights)
+        check_in = _clamp_date_mod(outbound_date, now_date) or now_date
+        ci_dt = _parse_date_mod(check_in)
+        if not ci_dt:
+            return
+        check_out = (ci_dt + timedelta(days=nights)).strftime("%Y-%m-%d")
+        party = intent.get("party") or {}
+        traveler_ids = party.get("traveler_ids") or []
+        guests = len(traveler_ids) or 1
+        new_stay = {
+            "location_code": city,
+            "check_in": check_in,
+            "check_out": check_out,
+            "number_of_guests": guests,
+        }
+        if traveler_ids:
+            new_stay["traveler_ids"] = traveler_ids
+        stays = list(lod.get("stays") or [])
+        stays.append(new_stay)
+        lod["stays"] = stays
+        lod["check_in"] = check_in
+        lod["check_out"] = check_out
+        lod["number_of_nights"] = nights
 
     def _apply_add_side_trip(self, intent: Dict[str, Any], change: Dict[str, Any], now_date: str) -> None:
         city = (change.get("city") or "").upper()[:3]

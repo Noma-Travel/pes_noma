@@ -426,6 +426,8 @@ class CommitPlan:
             else:
                 cache_keys.append('irn:tool_rs:pes_noma/modify_plan')
                 cache_keys.append('irn:tool_rs:pes_noma/generate_plan')
+                cache_keys.append('irn:tool_rs:pes/modify_plan')
+                cache_keys.append('irn:tool_rs:pes/generate_plan')
 
             for cache_key in cache_keys:
                 entry = workspace['cache'].get(cache_key)

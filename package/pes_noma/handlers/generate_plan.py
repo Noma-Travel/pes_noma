@@ -834,6 +834,9 @@ RULES:
 - Origin/destination for flights: use IATA airport codes when possible (JFK, EWR, SFO, LAX, MIA, MCO, DFW, GRU, etc.)
 - Origin/destination for train/bus: use city names (e.g., "Prague", "Bratislava", "Vienna", "Budapest")
 - travelers: {{"adults": N, "children": 0, "infants": 0}} - adults required
+- If the user does not specify passenger count, default to exactly 1 adult.
+- Do NOT infer traveler names from origins, destinations, cities, airports, or stations. Locations like Prague and Bratislava are never traveler names unless the user explicitly says they are people.
+- segments[].passengers should match the total travelers unless the user explicitly splits travelers across segments.
 - For "X days in Y" or "3 nights": check_out = check_in + nights; lodging.number_of_nights = X
 - Multi-city: output "segments" (one per transport leg) and "itinerary" [{{"from":"City","to":"City","date":"YYYY-MM-DD"}}]
 - Day trip: same date for outbound and return, lodging.needed = false, no stays
@@ -1443,6 +1446,8 @@ class GeneratePlan:
 Return ONLY a JSON array of strings with the names, e.g. ["Arthur", "Maria Silva"].
 If no names are mentioned return [].
 Do not invent names. Include every person explicitly named in the request.
+Exclude cities, airports, stations, destinations, dates, and transport terms.
+Never return trip locations like Prague or Bratislava as traveler names.
 
 Travel request: {user_message}"""
         try:
@@ -1462,6 +1467,49 @@ Travel request: {user_message}"""
         except Exception as e:
             print(f"[generate_plan] _extract_names_from_message error: {e}")
         return []
+
+    def _collect_intent_location_names(self, intent: Dict[str, Any]) -> set[str]:
+        """Collect location labels from the intent to avoid treating them as traveler names."""
+        names: set[str] = set()
+
+        def _add(value: Any):
+            if isinstance(value, dict):
+                value = value.get("code") or value.get("name")
+            if not value:
+                return
+            text = str(value).strip().lower()
+            if text:
+                names.add(text)
+
+        itinerary = intent.get("itinerary") or {}
+        for seg in itinerary.get("segments") or []:
+            _add(seg.get("origin"))
+            _add(seg.get("destination"))
+
+        lodging = itinerary.get("lodging") or {}
+        _add(lodging.get("location_hint"))
+        for stay in lodging.get("stays") or []:
+            _add(stay.get("location_code"))
+            _add(stay.get("location_hint"))
+
+        return names
+
+    def _filter_traveler_names(self, intent: Dict[str, Any], names: List[str]) -> List[str]:
+        """Drop extracted traveler names that are actually locations from the trip."""
+        location_names = self._collect_intent_location_names(intent)
+        if not location_names:
+            return names
+
+        filtered: List[str] = []
+        for name in names:
+            normalized = str(name).strip().lower()
+            if not normalized:
+                continue
+            if normalized in location_names:
+                print(f"[generate_plan] skipping extracted traveler name '{name}' because it matches a trip location")
+                continue
+            filtered.append(name)
+        return filtered
 
     def _resolve_traveler_ids_in_intent(
         self,
@@ -1493,6 +1541,7 @@ Travel request: {user_message}"""
             return intent
 
         names = self._extract_names_from_message(user_message, n_travelers)
+        names = self._filter_traveler_names(intent, names)
         print(f"[generate_plan] extracted traveler names: {names}")
 
         if not names:
