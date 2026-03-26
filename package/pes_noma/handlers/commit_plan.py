@@ -426,6 +426,8 @@ class CommitPlan:
             else:
                 cache_keys.append('irn:tool_rs:pes_noma/modify_plan')
                 cache_keys.append('irn:tool_rs:pes_noma/generate_plan')
+                cache_keys.append('irn:tool_rs:pes/modify_plan')
+                cache_keys.append('irn:tool_rs:pes/generate_plan')
 
             for cache_key in cache_keys:
                 entry = workspace['cache'].get(cache_key)
@@ -488,6 +490,53 @@ class CommitPlan:
 
 
 
+
+    def _sync_travelers_to_trip(self, intent, context):
+        """
+        Read resolved (real) traveler_ids from intent.party.traveler_ids
+        and persist them to the trip document via AddTravelers.
+
+        Synthetic IDs (t1, t2, …) are skipped — only real attendant IDs
+        that were resolved by generate_plan are synced.
+        """
+        party = intent.get('party') or {}
+        traveler_ids = party.get('traveler_ids') or []
+
+        # Filter out synthetic IDs (t1, t2, etc.) — keep only real ones
+        real_ids = [
+            tid for tid in traveler_ids
+            if not (str(tid).startswith('t') and str(tid)[1:].isdigit())
+        ]
+
+        if not real_ids:
+            print(f'[commit_plan] No real traveler_ids in intent — skipping sync')
+            return None
+
+        # Extract trip_id from entity_id (format: "portfolio-tripId")
+        entity_id = context.entity_id
+        parts = entity_id.split('-')
+        trip_id = '-'.join(parts[1:]) if len(parts) > 1 else None
+
+        if not trip_id:
+            print(f'[commit_plan] Could not extract trip_id from entity_id: {entity_id}')
+            return None
+
+        print(f'[commit_plan] Syncing travelers to trip {trip_id}: {real_ids}')
+
+        from noma.handlers.add_travelers import AddTravelers
+        handler = AddTravelers()
+        payload = {
+            'portfolio': context.portfolio,
+            'org': context.org,
+            'trip_id': trip_id,
+            'traveler_ids': real_ids,
+            'entity_type': context.entity_type,
+            'entity_id': context.entity_id,
+            'thread': context.thread,
+        }
+        result = handler.run(payload)
+        print(f'[commit_plan] Sync travelers result: success={result.get("success")} | ids={real_ids}')
+        return result
 
     def run(self, payload):
         action = 'run>commit_plan'
@@ -565,6 +614,16 @@ class CommitPlan:
         results.append(response_2)
         if not response_2['success']:
             return {'success': False, 'output': results}
+
+        # Sync resolved travelers from intent to the trip document
+        try:
+            plan_and_intent = response_1.get('output') or {}
+            intent = plan_and_intent.get('intent') or {}
+            sync_result = self._sync_travelers_to_trip(intent, context)
+            if sync_result:
+                results.append({'action': 'sync_travelers', **sync_result})
+        except Exception as e:
+            print(f'[commit_plan] Traveler sync failed (non-blocking): {e}')
 
         output = {
             'next_action':'initiate_plan',
