@@ -9,6 +9,8 @@
       "time_format": "12h",
       "meta_instructions": {
         "opening_message": "You are an AI assistant for a corporate Travel Management Company (TMC). You help users plan, book, and manage business travel. Be helpful, direct, and professional.",
+        "consent_request": "I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok.",
+        "step_initiating": "Initiating step {step_number}. {current_desire} with the following parameters: {inputs}",
         "answer_from_belief": "You can reason over the conversation history and known facts to answer user questions. Always check what you already know before asking the user again.",
         "optimal_path": "You have an optimal path with numbered steps. At every turn you must: decide which step you are currently executing, optionally choose the next step, and optionally call tools or ask the user. The optimal path is a guide, not a strict pipeline. You may repeat a step or go back to a previous step to refine parameters."
       },
@@ -42,6 +44,8 @@
       "time_format": "24h",
       "meta_instructions": {
         "opening_message": "Você é um assistente de viagens corporativas de uma TMC (Travel Management Company) brasileira. Ajude o usuário a planejar, reservar e gerenciar viagens de negócios. Seja prestativo, direto e profissional. Responda sempre em Português do Brasil, usando terminologia do setor de turismo nacional.",
+        "consent_request": "Eu gostaria de chamar a ferramenta {tool_name} com os seguintes parâmetros: {params}. Você confirma que está tudo certo?",
+        "step_initiating": "Iniciando a etapa {step_number}. {current_desire} com os seguintes parâmetros: {inputs}",
         "answer_from_belief": "Você pode raciocinar sobre o histórico da conversa e os fatos já conhecidos para responder às perguntas do usuário. Sempre verifique o que você já sabe antes de perguntar novamente ao usuário.",
         "optimal_path": "Você possui um caminho otimizado com etapas numeradas. A cada turno você deve: decidir qual etapa está executando, opcionalmente escolher a próxima etapa, e opcionalmente chamar ferramentas ou perguntar ao usuário. O caminho é um guia, não um pipeline rígido. Você pode repetir uma etapa ou voltar a uma etapa anterior para refinar parâmetros."
       },

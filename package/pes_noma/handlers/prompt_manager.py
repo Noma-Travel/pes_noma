@@ -54,6 +54,20 @@ class PromptManager:
         """Return a translated meta instruction string (opening_message, etc.)."""
         return self._lang_cfg["meta_instructions"].get(key, "")
 
+    def format_meta_instruction(self, key: str, **kwargs) -> str:
+        """
+        Fetch a meta instruction by key and format it with kwargs.
+        If the key doesn't exist, returns empty string.
+        """
+        template = self.get_meta_instruction(key)
+        if not template:
+            return ""
+        try:
+            return template.format(**kwargs)
+        except Exception:
+            # Avoid breaking the agent loop if formatting fails
+            return template
+
     def get_tone(self) -> str:
         return self._lang_cfg.get("tone", "")
 

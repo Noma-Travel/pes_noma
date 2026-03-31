@@ -293,13 +293,20 @@ class Specialist:
             arguments_dict = arguments
         params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
 
+        pm = PromptManager(config=self.config)
+        consent_msg = pm.format_meta_instruction(
+            "consent_request",
+            tool_name=tool_name,
+            params=params,
+        ) or f"I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok."
+
         consent = {
             'commands':payload['tool_calls'],
             'interface':'binary_consent',
             'nonce': random.randint(100000, 999999),
             'message':{
                 "role": "assistant",
-                "content": f'I would like to call {tool_name} tool with the following parameters:{params}. Please confirm it is ok'
+                "content": consent_msg
             }
         }
 
@@ -343,7 +350,14 @@ class Specialist:
                     inputs = f'{current_beliefs}'
 
                 step_number = int(continuity["plan_step"])
-                intro_msg = {'role':'assistant','content':f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'}
+                pm = PromptManager(config=self.config)
+                intro_content = pm.format_meta_instruction(
+                    "step_initiating",
+                    step_number=step_number,
+                    current_desire=current_desire,
+                    inputs=inputs,
+                ) or f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'
+                intro_msg = {'role':'assistant','content': intro_content}
                 c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
                 #self.AGU.save_chat(intro_msg, next = c_id)
                 #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
