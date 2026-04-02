@@ -388,7 +388,7 @@ class CommitPlan:
             # Get the workspaces in this thread
             response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread)
             workspaces_list = response['items']
-            #print('WORKSPACES_LIST >>',workspaces_list) #Verboso
+            _logger_trips.debug("workspaces_list | n=%s", len(workspaces_list or []))
 
             if not workspaces_list or len(workspaces_list) == 0:
                 _logger_trips.warning("no_workspaces_found | commit_plan")
@@ -416,6 +416,8 @@ class CommitPlan:
             else:
                 cache_keys.append('irn:tool_rs:pes_noma/modify_plan')
                 cache_keys.append('irn:tool_rs:pes_noma/generate_plan')
+                cache_keys.append('irn:tool_rs:pes/modify_plan')
+                cache_keys.append('irn:tool_rs:pes/generate_plan')
 
             for cache_key in cache_keys:
                 entry = workspace['cache'].get(cache_key)
@@ -423,15 +425,17 @@ class CommitPlan:
                     continue
                 output = entry.get('output') or {}
                 plan = output.get('plan')
+                intent = output.get('intent')
+                plan_and_intent = {'plan': plan, 'intent': intent}
                 if plan is not None:
-                    #print('Plan:', plan) #Verboso
-                    return {'success': True, 'action': action, 'input': '', 'output': plan}
+                    _logger_trips.info("commit_plan cache hit | key=%s", cache_key)
+                    return {'success': True, 'action': action, 'input': '', 'output': plan_and_intent}
 
-            _logger_trips.warning("cache_miss | key=%s | commit_plan", cache_key)
+            _logger_trips.warning("cache_miss | commit_plan | tried=%s", cache_keys)
             return {
                 'success': False,
                 'action': action,
-                'error': f'Plan with cache key {cache_key} not found in workspace',
+                'error': f'Plan not found in workspace cache (tried {cache_keys})',
                 'output': 0
             }
 
@@ -444,19 +448,18 @@ class CommitPlan:
                 'output': 0
             }
 
-    def add_plan(self,plan):
-        function = 'add_plan'
+    def add_plan_and_intent(self, payload):
+        function = 'add_plan_and_intent'
 
         try:
-            pr = f'add_plan > plan: {plan}'
-            #print(pr) #legacy print
-            saved = self.AGU.mutate_workspace({'plan': plan})
-            plan_id = plan['id']
+            _logger_trips.debug("add_plan_and_intent | plan_id=%s", (payload.get('plan') or {}).get('id'))
+            saved = self.AGU.mutate_workspace({'plan': payload['plan'], 'intent': payload['intent']})
+            plan_id = payload['plan']['id']
 
             if saved:
-                return {'success':True,'function':function,'input': plan,'output':plan_id}
+                return {'success': True, 'function': function, 'input': payload, 'output': plan_id}
             else:
-                return {'success':False,'function':function,'input': plan,'output':plan_id}
+                return {'success': False, 'function': function, 'input': payload, 'output': plan_id}
 
         except Exception as e:
             _logger_trips.error("save_plan_failed | %s", e)
@@ -467,6 +470,53 @@ class CommitPlan:
                 'error': pr,
                 'output': 0
             }
+
+    def _sync_travelers_to_trip(self, intent, context):
+        """
+        Read resolved (real) traveler_ids from intent.party.traveler_ids
+        and persist them to the trip document via AddTravelers.
+
+        Synthetic IDs (t1, t2, …) are skipped — only real attendant IDs
+        that were resolved by generate_plan are synced.
+        """
+        party = intent.get('party') or {}
+        traveler_ids = party.get('traveler_ids') or []
+
+        # Filter out synthetic IDs (t1, t2, etc.) — keep only real ones
+        real_ids = [
+            tid for tid in traveler_ids
+            if not (str(tid).startswith('t') and str(tid)[1:].isdigit())
+        ]
+
+        if not real_ids:
+            _logger_trips.debug("commit_plan | no real traveler_ids — skip sync")
+            return None
+
+        # Extract trip_id from entity_id (format: "portfolio-tripId")
+        entity_id = context.entity_id
+        parts = entity_id.split('-')
+        trip_id = '-'.join(parts[1:]) if len(parts) > 1 else None
+
+        if not trip_id:
+            _logger_trips.warning("commit_plan | could not extract trip_id from entity_id")
+            return None
+
+        _logger_trips.info("commit_plan | syncing travelers | trip=%s | ids=%s", trip_id, real_ids)
+
+        from noma.handlers.add_travelers import AddTravelers
+        handler = AddTravelers()
+        payload = {
+            'portfolio': context.portfolio,
+            'org': context.org,
+            'trip_id': trip_id,
+            'traveler_ids': real_ids,
+            'entity_type': context.entity_type,
+            'entity_id': context.entity_id,
+            'thread': context.thread,
+        }
+        result = handler.run(payload)
+        _logger_trips.info("commit_plan | sync travelers | success=%s", result.get("success"))
+        return result
 
     def run(self, payload):
         action = 'run>commit_plan'
@@ -538,10 +588,20 @@ class CommitPlan:
         if not response_1['success']:
             return {'success': False, 'output': results}
 
-        response_2 = self.add_plan(response_1['output'])
+        response_2 = self.add_plan_and_intent(response_1['output'])
         results.append(response_2)
         if not response_2['success']:
             return {'success': False, 'output': results}
+
+        # Sync resolved travelers from intent to the trip document
+        try:
+            plan_and_intent = response_1.get('output') or {}
+            intent = plan_and_intent.get('intent') or {}
+            sync_result = self._sync_travelers_to_trip(intent, context)
+            if sync_result:
+                results.append({'action': 'sync_travelers', **sync_result})
+        except Exception as e:
+            _logger_trips.warning("commit_plan | traveler sync non-blocking failure | %s", e)
 
         output = {
             'next_action':'initiate_plan',
