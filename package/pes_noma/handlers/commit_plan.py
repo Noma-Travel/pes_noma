@@ -15,7 +15,10 @@ from decimal import Decimal
 from openai import OpenAI
 
 import json
+import logging
 import re
+
+_logger_trips = logging.getLogger("agent.trips")
 
 # Custom JSON encoder to handle Decimal objects
 class DecimalEncoder(json.JSONEncoder):
@@ -51,9 +54,8 @@ class CommitPlan:
         try:
             openai_api_key = self.config.get('OPENAI_API_KEY', '')
             openai_client = OpenAI(api_key=openai_api_key)
-            print(f"OpenAI client initialized")
         except Exception as e:
-            print(f"Error initializing OpenAI client: {e}")
+            _logger_trips.error("openai_init_failed | commit_plan | %s", e)
             openai_client = None
 
         self.AI_1 = openai_client
@@ -317,7 +319,7 @@ class CommitPlan:
             try:
                 return json.loads(cleaned_response)
             except json.JSONDecodeError as e:
-                print(f"First attempt failed. Error: {e}")
+                _logger_trips.debug("json_first_parse_failed | retrying | %s", e)
                 #print(f"Cleaned response type: {type(cleaned_response)}")
                 #print(f"Cleaned response length: {len(cleaned_response)}")
                 #print(f"Cleaned response content: '{cleaned_response}'")
@@ -336,7 +338,7 @@ class CommitPlan:
                 return json.loads(cleaned_response)
 
         except json.JSONDecodeError as e:
-            print(f"Error parsing cleaned JSON response: {e}")
+            _logger_trips.error("json_parse_failed | commit_plan | %s", e)
             #print(f"Original response: {response}")
             #print(f"Cleaned response: {cleaned_response}")
             raise
@@ -366,7 +368,7 @@ class CommitPlan:
             return response.choices[0].message
 
         except Exception as e:
-            print(f"Error running LLM call: {e}")
+            _logger_trips.error("llm_call_failed | commit_plan | %s", e)
             # Only print raw response if it exists
             return False
 
@@ -389,7 +391,7 @@ class CommitPlan:
             #print('WORKSPACES_LIST >>',workspaces_list) #Verboso
 
             if not workspaces_list or len(workspaces_list) == 0:
-                print('No workspaces found')
+                _logger_trips.warning("no_workspaces_found | commit_plan")
                 return {
                     'success': False,
                     'action': action,
@@ -400,7 +402,7 @@ class CommitPlan:
             # Extract cache from workspace
             workspace = workspaces_list[0]
             if 'cache' not in workspace:
-                print('No cache found in workspace')
+                _logger_trips.warning("no_cache_in_workspace | commit_plan")
                 return {
                     'success': False,
                     'action': action,
@@ -425,7 +427,7 @@ class CommitPlan:
                     #print('Plan:', plan) #Verboso
                     return {'success': True, 'action': action, 'input': '', 'output': plan}
 
-            print(f'Cache key {cache_key} not found')
+            _logger_trips.warning("cache_miss | key=%s | commit_plan", cache_key)
             return {
                 'success': False,
                 'action': action,
@@ -434,7 +436,7 @@ class CommitPlan:
             }
 
         except Exception as e:
-            print(f'Error in find_in_cache: {str(e)}')
+            _logger_trips.error("find_in_cache_failed | %s", e)
             return {
                 'success': False,
                 'action': action,
@@ -457,8 +459,8 @@ class CommitPlan:
                 return {'success':False,'function':function,'input': plan,'output':plan_id}
 
         except Exception as e:
+            _logger_trips.error("save_plan_failed | %s", e)
             pr = f'Error in saving plan: {str(e)}'
-            print(pr)
             return {
                 'success': False,
                 'function': function,

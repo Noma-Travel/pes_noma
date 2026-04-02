@@ -1,9 +1,12 @@
 import json
+import logging
 import time
 import copy
 from typing import Any, Callable, Dict, List, Optional
 from decimal import Decimal
 from .specialist import Specialist
+
+_logger_executor = logging.getLogger("agent.executor")
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -197,8 +200,8 @@ class ExecutePlan:
             return response
 
         except Exception as e:
+            _logger_executor.error("call_specialist_failed | %s", e)
             pr = f"🤖❌ @_call_specialist:{e}"
-            print(pr)
             self.AGU.print_chat(pr, "error")
 
             return {
@@ -301,7 +304,6 @@ class ExecutePlan:
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
 
         function = "execute_plan > run"
-        print(f"[EXECUTOR] START | function={function} | plan_id={payload.get('plan_id')} | step={payload.get('plan_step')} | action_step={payload.get('action_step', '')}")
 
         """
         Execute (or resume) the given plan.
@@ -342,12 +344,9 @@ class ExecutePlan:
             if plan_state is None:
                 plan_state = self._init_plan_state(plan)
 
-            #print(f'Plan Steps:{plan["steps"]}') #Verboso
             steps_by_id = {str(step["step_id"]): step for step in plan["steps"]}
-            #print(f'PlanState Steps:{plan_state["steps"]}') #Verboso
             step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
 
-            #print("Starting plan execution...") #legacy print
             loop = 0
             # This is the plan_steps loop
             for step in plan["steps"]:
@@ -355,7 +354,8 @@ class ExecutePlan:
 
                 step_id = str(step["step_id"])
                 step_title = step["title"]
-                print(f"[EXECUTOR] loop_start={loop} | step_id={step_id} | title={step_title}")
+                step_action = step.get("action", "")
+                _logger_executor.info("executing step %s: %s action=%s", step_id, step_title, step_action)
 
                 pr = f"@ step {step_id}:{step_title}"
                 #print(pr) #legacy print
@@ -444,7 +444,7 @@ class ExecutePlan:
                         'status':'running'
                     }
                     self.AGU.mutate_workspace({"step_state": step_status}) # Changes status of the current step
-                    print(f"[EXECUTOR] step_transition | step_id={step_id} | status=running")
+                    _logger_executor.debug("step %s running", step_id)
 
                     # 1) Input Check
                     self._input_check(step)
@@ -491,8 +491,7 @@ class ExecutePlan:
                             'error': result.get('output', 'Specialist returned failure')
                         }
                         self.AGU.mutate_workspace({"step_state": step_status})
-                        print(f'Specialist returned failure for step {plan_id}:{step_id}')
-                        print(f"[EXECUTOR] step_transition | step_id={step_id} | status=failed")
+                        _logger_executor.info("step %s failed plan_id=%s", step_id, plan_id)
                         # Continue to next step (or break if you want to stop on failure)
                         break
 
@@ -507,16 +506,15 @@ class ExecutePlan:
                         }
                         self.AGU.mutate_workspace({"step_state": step_status})
 
-                        print(f'The specialist has declared that step {plan_id}:{step_id} is {status}')
-                        print(f"[EXECUTOR] step_transition | step_id={step_id} | status={status}")
+                        _logger_executor.info("step %s status=%s plan_id=%s", step_id, status, plan_id)
 
                     if status == 'awaiting':
-                        print(f"[EXECUTOR] step_waiting | step_id={step_id} | status={status}")
+                        _logger_executor.info("step %s waiting for user", step_id)
                         # Breaking the loop to wait for answer from user. Loop will be regenerated with the Continuity id.
                         break
 
                     elif status == 'completed':
-                        print(f"[EXECUTOR] loop_end={loop} | step_id={step_id} | status=completed")
+                        _logger_executor.info("step %s completed loop=%d", step_id, loop)
 
                 except Exception as e:
                     # Update step state and persist to state machine
@@ -564,8 +562,8 @@ class ExecutePlan:
 
         except Exception as e:
 
+            _logger_executor.error("execute_plan_run_failed | %s", e)
             pr = f"🤖❌ @execute_plan/run:{e}"
-            print(pr)
             self.AGU.print_chat(pr, "error")
 
             return {

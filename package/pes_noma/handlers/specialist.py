@@ -10,8 +10,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
 import json
+import logging
 import random
 import time
+
+_logger_specialist = logging.getLogger("agent.specialist")
+_logger_verify = logging.getLogger("agent.verify")
 
 class UniversalEncoder(json.JSONEncoder):
     """JSON encoder that handles Decimal, datetime, date, and other common types."""
@@ -120,9 +124,7 @@ class Specialist:
         else:
             arguments_dict = arguments
         params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
-        critical_keys = {"hint", "from_airport_code", "to_airport_code", "outbound_date", "return_date", "passengers", "destination", "origin", "hotel_name", "checkin", "checkout", "selection"}
-        critical_params = {k: v for k, v in arguments_dict.items() if k in critical_keys}
-        print(f"[SPECIALIST] Tool que precisa consentimento: {tool_name} | parametros_criticos={critical_params}")
+        _logger_specialist.info("consent required tool=%s params=%s", tool_name, params)
 
         consent = {
             'commands':payload['tool_calls'],
@@ -243,7 +245,7 @@ class Specialist:
                 messages.append({ "role": "system", "content":f'In case you need them, the following tools are recommended to execute this action: {json.dumps(action_tools)}'})
 
                 approved_tools = [tool.strip() for tool in action_tools.split(',')]
-                print(f"[SPECIALIST] tools_disponiveis={approved_tools}")
+                _logger_specialist.debug("tools_disponiveis=%s", approved_tools)
 
             # Tools
             '''
@@ -279,7 +281,7 @@ class Specialist:
                         try:
                             tool_input = json.loads(t.get('input', '[]'))
                         except json.JSONDecodeError:
-                            print(f"Invalid JSON in tool input for tool {t.get('key', 'unknown')}. Using empty array.")
+                            _logger_specialist.warning("invalid json tool input tool=%s", t.get('key', 'unknown'))
                             tool_input = []
 
                         dict_params = {}
@@ -374,7 +376,7 @@ class Specialist:
                 if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
-                    print(f"[SPECIALIST] interpret_result | action=tool_call | tool={selected_tool}")
+                    _logger_specialist.info("tool call selected=%s", selected_tool)
 
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
                         #print(f'Interpret() >> Run this tool:{validated_result}') #legacy print
@@ -450,7 +452,7 @@ class Specialist:
                             #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
                         else:
                             #print(f'Interpret() >> The agent is asking something to the user: {validated_result}') #legacy print
-                            print(f"[SPECIALIST] interpret_result | action=message_to_user | content={str(validated_result.get('content', ''))[:140]}")
+                            _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
                             nonce = random.randint(100000, 999999)
                             c_id = f'{c_id_pre}:*:1:{nonce}'
                             msg = validated_result.get('content')
@@ -477,7 +479,7 @@ class Specialist:
             }
 
         except Exception as e:
-            print(f"Error in interpret() message: {e}")
+            _logger_specialist.error("interpret_failed | %s", e)
             return {
                 'success': False,
                 'action': action,
@@ -515,7 +517,7 @@ class Specialist:
             tid = command['tool_calls'][0]['id']
             hidden_keys = {'_portfolio', '_org', '_entity_type', '_entity_id', '_thread', '_init', 'plan_id', 'plan_step', 'action_step', 'tool_step', 'continuity', 'workspace', 'state_machine'}
             user_params = {k: v for k, v in params.items() if k not in hidden_keys}
-            print(f"[SPECIALIST] tool_start | tool={tool_name} | params={user_params}")
+            _logger_specialist.info("calling tool=%s params=%s", tool_name, user_params)
 
             #print(f'tid:{tid}') #legacy print
 
@@ -529,14 +531,14 @@ class Specialist:
             # Check if handler exists
             if tool_name not in list_handlers:
                 error_msg = f"❌ No handler found for tool '{tool_name}'"
-                print(error_msg)
+                _logger_specialist.error("handler_not_found | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
             # Check if handler is an empty string
             if list_handlers[tool_name] == '':
                 error_msg = f"❌ Handler is empty"
-                print(error_msg)
+                _logger_specialist.error("handler_empty | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -550,7 +552,7 @@ class Specialist:
             parts = handler_route.split('/')
             if len(parts) < 2 or len(parts) > 3:
                 error_msg = f"❌ {tool_name} is not a valid tool. Handler route must be 'tool/handler' or 'tool/handler/subhandler'."
-                print(error_msg)
+                _logger_specialist.error("invalid_handler_route | tool=%s | route=%s", tool_name, handler_route if 'handler_route' in dir() else '')
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -568,7 +570,7 @@ class Specialist:
             params['_thread'] = self._get_context().thread
             params['_init'] = handler_init
 
-            print(f'Calling {handler_route} ')
+            _logger_specialist.debug("calling handler route=%s", handler_route)
 
             response = self.SHC.handler_call(portfolio, org, tool, handler, params)
 
@@ -577,7 +579,7 @@ class Specialist:
             #print(f'Handler response:{response}') #Verboso
             response_clean = {k: v for k, v in response.items() if k not in ['stack', 'output']}
             response_clean['output_size'] = len(str(response.get('output', '')))
-            print(f"[SPECIALIST] handler_response | tool={tool_name} | success={response.get('success')} | details={response_clean}")
+            _logger_specialist.info("tool=%s returned success=%s details=%s", tool_name, response.get('success'), response_clean)
 
             #raise Exception('Troubleshooting stop')
 
@@ -655,8 +657,7 @@ class Specialist:
             #print(f'flag5') #legacy print
 
             #print(f'message output: {tool_out}')
-            print("✅ Tool execution complete.")
-            print(f"[SPECIALIST] tool_end | tool={tool_name} | success=True")
+            _logger_specialist.info("tool=%s done success=True", tool_name)
 
             return {"success": True, "function": function, "input": command, "output": tool_out}
 
@@ -704,7 +705,7 @@ class Specialist:
 
             if len(parts) != 2:
                 error_msg = f"❌ {tool_name} is not a valid tool."
-                print(error_msg)
+                _logger_specialist.error("invalid_tool_route | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -769,7 +770,7 @@ class Specialist:
 
             if len(parts) != 2:
                 error_msg = f"❌ {verification_handler} is not a valid verification tool."
-                print(error_msg)
+                _logger_verify.error("invalid_verification_route | handler=%s", verification_handler)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -792,7 +793,7 @@ class Specialist:
             params['state_machine'] = workspace['state_machine'][continuity['plan_id']]
 
             response = self.SHC.handler_call(portfolio,org,parts[0],parts[1],params)
-            print(f"[VERIFY] called | action={action} | handler={verification_handler}")
+            _logger_verify.info("verify_called | action=%s | handler=%s", action, verification_handler)
 
             if response['success']:
                 msg = f"Verification OK. Step Completed."
@@ -808,7 +809,7 @@ class Specialist:
 
                 self.AGU.print_chat(msg,'transient')
                 #print(msg) #legacy print
-                print(f"[VERIFY] result=SUCCESS | stop_loop=True")
+                _logger_verify.info("verify_result | result=SUCCESS | stop_loop=True")
 
             else:
                 msg = f"Step has not been completed yet. Continue the loop"
@@ -821,7 +822,7 @@ class Specialist:
                 self.AGU.mutate_workspace({'action_log': log_entry})
                 # We don't need to record in action_log when verification is KO
                 #print(msg) #legacy print
-                print(f"[VERIFY] result=FAILED | stop_loop=False")
+                _logger_verify.info("verify_result | result=FAILED | stop_loop=False")
 
             return {"success": response['success'], "action": function, "input": "", "output": response['output']}
 
@@ -898,7 +899,7 @@ class Specialist:
         '''
 
         action = 'run > specialist'
-        print(f"[SPECIALIST] START | action={action} | step_id={payload.get('step_id')} | current_action={payload.get('action')} | inputs={payload.get('inputs', {})}")
+        _logger_specialist.info("specialist started action=%s step_id=%s", payload.get('action'), payload.get('step_id'))
 
         # Get context from AGU if available, otherwise create new
 
@@ -948,7 +949,7 @@ class Specialist:
             verification_result = ''
             while loops < loop_limit:
                 loops = loops + 1
-                print(f"[SPECIALIST] loop_start {loops}/{loop_limit}")
+                _logger_specialist.debug("loop %d/%d", loops, loop_limit)
 
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
                 response_1 = self.interpret(tool_result=tool_result)
