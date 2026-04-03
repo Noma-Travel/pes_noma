@@ -5,7 +5,7 @@ from renglo.common import load_config
 
 from openai import OpenAI
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -52,6 +52,48 @@ def sanitize(obj):
         return sanitize(obj.__dict__)
     # Fallback: convert to string
     return str(obj)
+
+
+def verification_output_yield_for_user(
+    handler_output: Any,
+    depth: int = 0,
+    _seen: Optional[Set[int]] = None,
+) -> bool:
+    """
+    Per-action verifiers may set yield_for_user on a failed verification so the
+    specialist stops the ReAct loop with status awaiting (user acts on options).
+
+    SchdController.handler_call failure responses use output as a list of payload
+    dicts (canonical = [inner_output]); this must be traversed, not only dicts.
+
+    Bounded work: max depth, cycle detection via _seen (per top-level call only),
+    no globals — nothing persists after return (no leak).
+    """
+    if _seen is None:
+        _seen = set()
+    if depth > 12 or handler_output is None:
+        return False
+    if isinstance(handler_output, list):
+        return any(
+            verification_output_yield_for_user(item, depth + 1, _seen)
+            for item in handler_output
+        )
+    if isinstance(handler_output, dict):
+        oid = id(handler_output)
+        if oid in _seen:
+            return False
+        _seen.add(oid)
+        try:
+            if handler_output.get('yield_for_user'):
+                return True
+            inner = handler_output.get('output')
+            if inner is not None and inner is not handler_output:
+                return verification_output_yield_for_user(inner, depth + 1, _seen)
+            return False
+        finally:
+            _seen.discard(oid)
+    return False
+
 
 @dataclass
 class RequestContext:
@@ -663,12 +705,11 @@ class Specialist:
                     else:
                     # This is the LLM asking something to the user.
                         if tool_result == 'fresh_results':
+                            # Intentionally do NOT save the LLM's interpretation here. It is often
+                            # a redundant rephrasing of the tool output (e.g. a long paragraph
+                            # repeating flight data). The tool output was already saved in act()
+                            # with next=c_id; the user sees that. Saving here would duplicate it.
                             print(f'Interpret() >> The agent has interpreted the tool results:{validated_result}')
-                            c_id = self._get_context().tool_response_c_id
-                            c_id_parts = c_id.split(':')
-                            nonce = c_id_parts[6]
-                            msg = validated_result.get('content')
-                            #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
                         else:
                             print(f'Interpret() >> The agent is asking something to the user: {validated_result}')
                             nonce = random.randint(100000, 999999)
@@ -1015,6 +1056,7 @@ class Specialist:
             workspace = self.AGU.get_active_workspace()
             params['plan'] = workspace['plan'][continuity['plan_id']]
             params['state_machine'] = workspace['state_machine'][continuity['plan_id']]
+            params['workspace_cache'] = workspace.get('cache') or {}
 
             response = self.SHC.handler_call(portfolio,org,parts[0],parts[1],params)
 
@@ -1046,7 +1088,12 @@ class Specialist:
                 else:
                     actionable = None
 
-                msg = f"Step has not been completed yet. Continue the loop"
+                yield_user = verification_output_yield_for_user(output)
+                msg = (
+                    "Paused for user selection (verifier)."
+                    if yield_user
+                    else "Step has not been completed yet. Continue the loop"
+                )
                 continuity = self._get_context().continuity
                 log_entry = {
                             "plan_id":continuity["plan_id"],
@@ -1054,8 +1101,9 @@ class Specialist:
                             "message":msg,
                             "actionable":actionable
                 }
+                if yield_user:
+                    log_entry["yield_for_user"] = True
                 self.AGU.mutate_workspace({'action_log': log_entry})
-                # We don't need to record in action_log when verification is KO
                 print(msg)
 
 
@@ -1261,7 +1309,14 @@ class Specialist:
 
                         self.AGU.mutate_workspace({'action_log': log_entry})
 
-
+                    elif verification_output_yield_for_user(response_2c.get('output')):
+                        print('Run() >> Verifier requested yield; exiting ReAct loop for user selection.')
+                        self.AGU.print_chat(f'🤖','transient')
+                        output = {'status': 'awaiting'}
+                        c_id = getattr(self._get_context(), 'tool_response_c_id', None)
+                        if c_id:
+                            output['next'] = c_id
+                        return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
 
                 elif 'tool_calls' not in response_1['output'] or not response_1['output']['tool_calls']:
                     # No Tool needs execution.
@@ -1271,12 +1326,11 @@ class Specialist:
 
                     self.AGU.print_chat(f'🤖','transient')
 
-                    # The above code is creating a Python dictionary named `output` with a single
-                    # key-value pair. The key is 'status' and the value is 'awaiting'.
-
-                    output = {
-                        'status':'awaiting'
-                    }
+                    # Include next (continuity id) so outer agents can pass through without re-introspecting.
+                    output = {'status': 'awaiting'}
+                    c_id = getattr(self._get_context(), 'tool_response_c_id', None)
+                    if c_id:
+                        output['next'] = c_id
 
                     return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
 
