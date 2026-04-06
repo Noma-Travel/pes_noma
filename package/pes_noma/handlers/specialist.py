@@ -330,7 +330,7 @@ class Specialist:
             continuity = self._get_context().continuity
             print(continuity)
             message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
-            message_list = self.AGU.get_message_history(filter=message_filter)
+            message_list = self.AGU.get_message_history(filter=message_filter, target='llm')
 
             print(f'Specialist Message History: {message_list}')
 
@@ -594,8 +594,16 @@ class Specialist:
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
 
+                    # Determine if this tool requires user consent before execution
+                    # Default: True (safe — requires consent unless explicitly marked otherwise)
+                    tool_requires_consent = True
+                    for t in self._get_context().list_tools:
+                        if t.get('key') == selected_tool:
+                            tool_requires_consent = t.get('requires_consent', True)
+                            break
+
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
-                        print(f'Interpret() >> Run this tool:{validated_result}')
+                        print(f'Interpret() >> Run this tool (consent given):{validated_result}')
                         # The last message was a response to "3 = WAITING HUMAN".
                         # The continuity response matches with the selected_tool. Execute tool
 
@@ -616,10 +624,30 @@ class Specialist:
                         }
                         self.AGU.mutate_workspace({'action_log': log_entry})
 
+                    elif not tool_requires_consent:
+                        print(f'Interpret() >> Auto-executing tool (no consent required):{validated_result}')
+                        # Tool does NOT require consent — execute directly (silent automation)
+
+                        nonce = random.randint(100000, 999999)
+                        tool_step = '4' # 4  = EXECUTION_REQUEST
+                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{nonce}'
+                        self.AGU.save_chat(validated_result, next = c_id)
+
+                        log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":selected_tool,
+                            "status":tool_step,
+                            "nonce":nonce,
+                            "message":"Auto-executing tool (no consent required)",
+                            "type":"auto_execute"
+                        }
+                        self.AGU.mutate_workspace({'action_log': log_entry})
+
                     else:
 
                         print(f'Interpret() >> Switching tool call into a message: {validated_result}')
-                        # We are turning the tool call into a message to the user
+                        # Tool REQUIRES consent — ask the user for approval
 
                         tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
                         consent = self.consent_form(validated_result)
@@ -829,7 +857,16 @@ class Specialist:
             # Important: Because we had to create a response message in advance, we are upserting an existing message, not creating a new one.
             #  The upsert only takes 'content', '_interface' and '_next' changes.
 
-            self.AGU.save_chat(tool_out,interface=interface, next=c_id)
+            # Determine message routing: tools that don't require consent send results
+            # only to the LLM (not to the UI), enabling silent automation.
+            tool_requires_consent = True
+            for t in self._get_context().list_tools:
+                if t.get('key') == tool_name:
+                    tool_requires_consent = t.get('requires_consent', True)
+                    break
+            act_go_to = ['llm', 'ui'] if tool_requires_consent else ['llm']
+
+            self.AGU.save_chat(tool_out, interface=interface, next=c_id, go_to=act_go_to)
 
 
             print(f'act:Saved tool results to chat')
