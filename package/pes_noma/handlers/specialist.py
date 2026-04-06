@@ -616,10 +616,21 @@ class Specialist:
 
                     # Determine if this tool requires user consent before execution
                     # Default: True (safe — requires consent unless explicitly marked otherwise)
+                    # Check root level first, then fall back to init dict
                     tool_requires_consent = True
                     for t in self._get_context().list_tools:
                         if t.get('key') == selected_tool:
-                            tool_requires_consent = t.get('requires_consent', True)
+                            if 'requires_consent' in t:
+                                tool_requires_consent = t.get('requires_consent', True)
+                            else:
+                                init_val = t.get('init', {})
+                                if isinstance(init_val, str):
+                                    try:
+                                        init_val = json.loads(init_val)
+                                    except (json.JSONDecodeError, ValueError):
+                                        init_val = {}
+                                if isinstance(init_val, dict):
+                                    tool_requires_consent = init_val.get('requires_consent', True)
                             break
 
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
@@ -879,10 +890,21 @@ class Specialist:
 
             # Determine message routing: tools that don't require consent send results
             # only to the LLM (not to the UI), enabling silent automation.
+            # Check root level first, then fall back to init dict
             tool_requires_consent = True
             for t in self._get_context().list_tools:
                 if t.get('key') == tool_name:
-                    tool_requires_consent = t.get('requires_consent', True)
+                    if 'requires_consent' in t:
+                        tool_requires_consent = t.get('requires_consent', True)
+                    else:
+                        init_val = t.get('init', {})
+                        if isinstance(init_val, str):
+                            try:
+                                init_val = json.loads(init_val)
+                            except (json.JSONDecodeError, ValueError):
+                                init_val = {}
+                        if isinstance(init_val, dict):
+                            tool_requires_consent = init_val.get('requires_consent', True)
                     break
             act_go_to = ['llm', 'ui'] if tool_requires_consent else ['llm']
 
