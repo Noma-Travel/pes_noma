@@ -363,10 +363,12 @@ class Specialist:
 
             action_instructions = ''
             action_tools = ''
+            current_action_obj = None
             list_actions = self._get_context().list_actions
 
             for a in list_actions:
                 if a['key'] == self._get_context().current_action:
+                    current_action_obj = a
                     action_instructions = a['prompt_3_reasoning_and_planning']
 
                     if 'tools_reference' in a and a['tools_reference'] and a['tools_reference'] not in ['_','-','.']:
@@ -421,6 +423,24 @@ class Specialist:
             except Exception as e:
                 print(f"Error generating plan summary: {e}")
                 # Continue without plan summary if there's an error
+
+            # Inject context modules configured for this action
+            try:
+                from pes_noma.handlers.context_providers import CONTEXT_PROVIDERS
+                context_modules = current_action_obj.get('context_modules', []) if current_action_obj else []
+                for module_name in context_modules:
+                    provider = CONTEXT_PROVIDERS.get(module_name)
+                    if provider:
+                        ctx_text = provider.get_context(
+                            workspace or {},
+                            continuity,
+                            self.AGU
+                        )
+                        if ctx_text:
+                            messages.append({"role": "system", "content": ctx_text})
+                            print(f"Injected context module: {module_name}")
+            except Exception as e:
+                print(f"Error injecting context modules: {e}")
 
             # Add the incoming messages
             for msg in message_list:
