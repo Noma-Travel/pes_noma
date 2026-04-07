@@ -574,11 +574,16 @@ class Specialist:
                         #print(f'List Tools:{list_tools}')
 
 
-            # Salva o messages e o list_tools em arquivos JSON separados para leitura
-            with open('prompt_messages.json', 'w', encoding='utf-8') as msg_file:
-                json.dump(messages, msg_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
-            with open('prompt_tools.json', 'w', encoding='utf-8') as tools_file:
-                json.dump(list_tools, tools_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
+            # Persist prompt artifacts only to Lambda-writable storage.
+            # Lambda's deployment directory is read-only; writing there raises Errno 30.
+            try:
+                with open('/tmp/prompt_messages.json', 'w', encoding='utf-8') as msg_file:
+                    json.dump(messages, msg_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
+                with open('/tmp/prompt_tools.json', 'w', encoding='utf-8') as tools_file:
+                    json.dump(list_tools, tools_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
+            except Exception as write_err:
+                # This debug persistence must never break runtime execution.
+                print(f"Prompt debug file write skipped: {write_err}")
 
             # Prompt
             prompt = {
