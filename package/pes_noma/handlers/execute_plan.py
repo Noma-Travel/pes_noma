@@ -1,17 +1,18 @@
 import json
+import logging
 import time
 import copy
 from typing import Any, Callable, Dict, List, Optional
 from decimal import Decimal
 from .specialist import Specialist
 
+_logger_executor = logging.getLogger("agent.executor")
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Decimal):
             return int(obj) if obj % 1 == 0 else float(obj)
         return super(DecimalEncoder, self).default(obj)
-
 
 class ExecutePlan:
     """
@@ -158,9 +159,9 @@ class ExecutePlan:
                     "input": payload,
                     "output": f"Step {payload['step_id']} has no 'action' specified",
                 }
-                
-            print("Caller payload:", payload)
-            
+
+            #print("Caller payload:", payload) #legacy print
+
             '''
             payload example
             {
@@ -180,28 +181,27 @@ class ExecutePlan:
                 "continuity": {"plan_id": "c37333bc","plan_step": 0, "action_step": 0, "tool_step": 0},
             }
             '''
-            
+
             caller = Specialist(self.AGU)
             response = caller.run(payload)
             # Sanitize the response to convert any exception objects to strings
             #print("Caller response:", response)
-            
+
             response = self._sanitize(response)
 
             if not response["success"]:
                 print("Specialist came back with an error:",response)
-            
-            
+
             '''
             When step is complete, this comes back in the response
             response['output'] -> {"status": "completed"}
             '''
-            
+
             return response
 
         except Exception as e:
+            _logger_executor.error("call_specialist_failed | %s", e)
             pr = f"🤖❌ @_call_specialist:{e}"
-            print(pr)
             self.AGU.print_chat(pr, "error")
 
             return {
@@ -299,13 +299,11 @@ class ExecutePlan:
     def _now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-
     # ---------- Public API ----------
 
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
 
         function = "execute_plan > run"
-        print("Running:", function, payload)
 
         """
         Execute (or resume) the given plan.
@@ -327,7 +325,7 @@ class ExecutePlan:
             continuity["tool_step"] = str(payload.get("tool_step", 0))
 
             workspace = self.AGU.get_active_workspace()
-            print("Retrieving plan from active workspace:", workspace)
+            #print("Retrieving plan from active workspace:", workspace) #Verboso
 
             # Validate workspace structure
             if "plan" not in workspace:
@@ -345,28 +343,24 @@ class ExecutePlan:
 
             if plan_state is None:
                 plan_state = self._init_plan_state(plan)
-                
-            print(f'Plan Steps:{plan["steps"]}') 
-            steps_by_id = {str(step["step_id"]): step for step in plan["steps"]}
-            print(f'PlanState Steps:{plan_state["steps"]}') 
-            step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
-            
 
-            
-            print("Starting plan execution...")
+            steps_by_id = {str(step["step_id"]): step for step in plan["steps"]}
+            step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
+
             loop = 0
-            passthrough_next = None
             # This is the plan_steps loop
             for step in plan["steps"]:
                 loop = loop+1
-                
-                step_id = str(step["step_id"]) 
+
+                step_id = str(step["step_id"])
                 step_title = step["title"]
+                step_action = step.get("action", "")
+                _logger_executor.info("executing step %s: %s action=%s", step_id, step_title, step_action)
 
                 pr = f"@ step {step_id}:{step_title}"
-                print(pr)
+                #print(pr) #legacy print
                 self.AGU.print_chat(pr, "transient")
-                
+
                 if loop > 1:
                     # If this is not the initial loop, the state machine will be stale.
                     # Refreshing local state machine
@@ -375,57 +369,52 @@ class ExecutePlan:
                     step_states_by_id = {str(s["step_id"]): s for s in plan_state["steps"]}
                     # Also, we update the plan step to be current
                     continuity["plan_step"] = step_id
-                    
+
                 else:
-                    
+
                     # Compare current step_id to the suggestion in continuity id. If they match, let them start
-                    # If they don't match, notify that the continuity id is invalid and that the active step will be initiated. 
-                    
+                    # If they don't match, notify that the continuity id is invalid and that the active step will be initiated.
+
                     if step_id != continuity["plan_step"]:
                         pr = "The continuity id is pointing to a completed or non existing step. Proceeding to the active step."
-                        print(pr)
+                        #print(pr) #legacy print
                         self.AGU.print_chat(pr, "transient")
                         continuity["plan_step"] = step_id
                     else:
                         pr = "The continuity id is pointing to a valid step."
-                        print(pr)
+                        #print(pr) #legacy print
                         self.AGU.print_chat(pr, "transient")
-                        
-                
+
                 # Ensure step_state exists, break if it doesn't
                 if step_id not in step_states_by_id:
                     pr = f"⚠️ Step {step_id} not found in step_states_by_id"
-                    print(pr)
+                    #print(pr) #legacy print
                     self.AGU.print_chat(pr, "transient")
                     raise KeyError(f"Step ID '{step_id}' not found in State Machine")
-                
-                
+
                 # Check if the step has a status that needs to be skipped
                 step_state = step_states_by_id[step_id]
                 if step_state["status"] in (
                     "completed"
                 ):
-                    print(f'Skipping step. Status:{step_state["status"]}')
+                    #print(f'Skipping step. Status:{step_state["status"]}') #legacy print
                     continue
-                 
 
-                 
                 # If the last step completed successfully, it would have declared that step status as completed.
-                # When the new loop starts, the executor should advance to the next step naturally without the need of a special signal or flag from the last step. 
-                # This is to make the loops independent from execution threads. 
+                # When the new loop starts, the executor should advance to the next step naturally without the need of a special signal or flag from the last step.
+                # This is to make the loops independent from execution threads.
                 # If a step_id doesn't exist in the state machine, loop should be aborted. The steps in the state machine were initialized before entering the loop.
-                # The only reason to skip a step is if it has been completed. Skipping steps with errors could cause a domino effect. Step dependency checks should take care of that. 
-                # A step that is waiting for consent or more data, should have status=awaiting. That status is set by the specialist not by the executor. 
-                
+                # The only reason to skip a step is if it has been completed. Skipping steps with errors could cause a domino effect. Step dependency checks should take care of that.
+                # A step that is waiting for consent or more data, should have status=awaiting. That status is set by the specialist not by the executor.
 
                 '''
                 # Respect dependencies
-                print("Checking step dependencies...")
+                #print("Checking step dependencies...") #legacy print
                 if not self._dependencies_satisfied(step, step_states_by_id):
                     # At least one dependency failed or is blocked -> block this step
                     if self._dependencies_failed_or_blocked(step, step_states_by_id):
-                        print('Step is blocked')
-                        
+                        #print('Step is blocked') #legacy print
+
                         # Report dependency error to state machine
                         step_status = {
                             'plan_id':plan_id,
@@ -437,26 +426,26 @@ class ExecutePlan:
                         self.AGU.mutate_workspace({"step_state": step_status}) # Changes status of the current step
                         # Step is blocked, skip to next step
                         continue
-                        
+
                     # If dependencies are just not ready yet, skip in this pass
                     msg = "Skipping step because of dependencies..."
-                    print(msg)
+                    #print(msg) #legacy print
                     continue
                 '''
-                  
+
                 # Calling the specialist
-                try: 
-                  
+                try:
+
                     # Report current step status to 'running' to state machine.
                     step_status = {
                         'plan_id':plan_id,
                         'plan_step':step_id,
                         'started_at':self._now(),
                         'status':'running'
-                    } 
+                    }
                     self.AGU.mutate_workspace({"step_state": step_status}) # Changes status of the current step
-                    
-                    
+                    _logger_executor.debug("step %s running", step_id)
+
                     # 1) Input Check
                     self._input_check(step)
 
@@ -469,13 +458,13 @@ class ExecutePlan:
                         p["finished_at"] = self._now()
                         # Step is guarded. Report step as guarded to state machine.
                         self.AGU.mutate_workspace({"step_state": p}) # Changes status of the current step
-                        
+
                         continue
                     '''
 
                     # 3) Call Action
                     pr = f'Calling action:{step["action"]}'
-                    print(pr)
+                    #print(pr) #legacy print
                     self.AGU.print_chat(pr, "transient")
 
                     specialist_payload = step.copy()
@@ -487,7 +476,7 @@ class ExecutePlan:
                     result = self._call_specialist(specialist_payload)
                     pr = f"Result after calling specialist:{result}"
                     #print(pr)
-                    
+
                     # Recording output status
                     # It could be either 'completed', 'awaiting' or 'error'
                     status = ''
@@ -502,34 +491,30 @@ class ExecutePlan:
                             'error': result.get('output', 'Specialist returned failure')
                         }
                         self.AGU.mutate_workspace({"step_state": step_status})
-                        print(f'Specialist returned failure for step {plan_id}:{step_id}')
+                        _logger_executor.info("step %s failed plan_id=%s", step_id, plan_id)
                         # Continue to next step (or break if you want to stop on failure)
                         break
-                    
+
                     elif result.get('success') and isinstance(result.get('output'), dict) and 'status' in result['output']:
                         status = result['output']['status']
-                        
+
                         step_status = {
                             'plan_id':plan_id,
                             'plan_step':step_id,
                             'finished_at':self._now(),
                             'status':status
-                        }     
+                        }
                         self.AGU.mutate_workspace({"step_state": step_status})
-                        
-                        print(f'The specialist has declared that step {plan_id}:{step_id} is {status}')
-                    
-                    
-                    
+
+                        _logger_executor.info("step %s status=%s plan_id=%s", step_id, status, plan_id)
+
                     if status == 'awaiting':
-                        passthrough_next = result.get('output', {}).get('next')
-                        print(f'The step has status {status}.')   
+                        _logger_executor.info("step %s waiting for user", step_id)
                         # Breaking the loop to wait for answer from user. Loop will be regenerated with the Continuity id.
                         break
 
                     elif status == 'completed':
-                        print('Step has been finished, going to the next step in the plan')
-                           
+                        _logger_executor.info("step %s completed loop=%d", step_id, loop)
 
                 except Exception as e:
                     # Update step state and persist to state machine
@@ -547,11 +532,9 @@ class ExecutePlan:
                     step_state["finished_at"] = step_status["finished_at"]
                     step_state["error"] = step_status["error"]
 
-                
-
             # Determine overall status
             pr = f"The execution loop has been suspended. Waiting for further action"
-            print(pr)
+            #print(pr) #legacy print
             #self.AGU.print_chat(pr, "transient")
 
             '''p = {}
@@ -569,22 +552,18 @@ class ExecutePlan:
             plan_state = workspace['state_machine'][plan_id]
             summary = self._build_summary(plan_state)
             '''
-            
 
-            out = {
+            return {
                 "success": True,
                 "function": function,
                 "input": payload,
                 "output": '',
             }
-            if passthrough_next:
-                out["next"] = passthrough_next
-            return out
 
         except Exception as e:
 
+            _logger_executor.error("execute_plan_run_failed | %s", e)
             pr = f"🤖❌ @execute_plan/run:{e}"
-            print(pr)
             self.AGU.print_chat(pr, "error")
 
             return {
@@ -593,7 +572,6 @@ class ExecutePlan:
                 "input": payload,
                 "output": e,
             }
-
 
 # ---------- Example usage with your plan ----------
 
@@ -705,5 +683,3 @@ if __name__ == "__main__":
 
     summary = executor.run(plan)
     print(json.dumps(summary, indent=2, cls=DecimalEncoder))
-
-

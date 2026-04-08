@@ -14,9 +14,11 @@ from decimal import Decimal
 #from jsonschema import validate, ValidationError
 from openai import OpenAI
 
-
 import json
+import logging
 import re
+
+_logger_trips = logging.getLogger("agent.trips")
 
 # Custom JSON encoder to handle Decimal objects
 class DecimalEncoder(json.JSONEncoder):
@@ -24,16 +26,6 @@ class DecimalEncoder(json.JSONEncoder):
         if isinstance(obj, Decimal):
             return float(obj)
         return super(DecimalEncoder, self).default(obj)
-
-def _inner_context(entity_type: str, entity_id: str, thread: str):
-    """When stacked (outer/inner), return innermost part. Workspaces are stored at inner level."""
-    def last_part(v, sep="/"):
-        if not v or sep not in str(v):
-            return v
-        parts = [p.strip() for p in str(v).split(sep) if p.strip()]
-        return parts[-1] if parts else v
-    return last_part(entity_type), last_part(entity_id), last_part(thread)
-
 
 @dataclass
 class RequestContext:
@@ -62,9 +54,8 @@ class CommitPlan:
         try:
             openai_api_key = self.config.get('OPENAI_API_KEY', '')
             openai_client = OpenAI(api_key=openai_api_key)
-            print(f"OpenAI client initialized")
         except Exception as e:
-            print(f"Error initializing OpenAI client: {e}")
+            _logger_trips.error("openai_init_failed | commit_plan | %s", e)
             openai_client = None
 
         self.AI_1 = openai_client
@@ -78,7 +69,6 @@ class CommitPlan:
         self.DCC = DocsController(config=self.config)
         self.BPC = BlueprintController(config=self.config)
         self.CHC = ChatController(config=self.config)
-
 
     def _get_context(self) -> RequestContext:
         """Get the current request context."""
@@ -195,7 +185,6 @@ class CommitPlan:
             "required": ["image", "amenities", "thumbnail", "latitude", "longitude", "currentPrice", "name", "id", "roomType"]
         }
 
-
         if isinstance(segment, str):
             try:
                 print(f"Attempting to parse JSON string: {segment[:200]}...")  # Show first 200 chars
@@ -254,7 +243,6 @@ class CommitPlan:
 
     '''
 
-
     def _clean_json_string(self, json_str):
         """Clean common JSON formatting issues"""
         import re
@@ -271,8 +259,6 @@ class CommitPlan:
         json_str = re.sub(r'\bNone\b', 'null', json_str)
 
         return json_str
-
-
 
     def clean_json_response(self, response):
         """
@@ -333,7 +319,7 @@ class CommitPlan:
             try:
                 return json.loads(cleaned_response)
             except json.JSONDecodeError as e:
-                print(f"First attempt failed. Error: {e}")
+                _logger_trips.debug("json_first_parse_failed | retrying | %s", e)
                 #print(f"Cleaned response type: {type(cleaned_response)}")
                 #print(f"Cleaned response length: {len(cleaned_response)}")
                 #print(f"Cleaned response content: '{cleaned_response}'")
@@ -351,14 +337,11 @@ class CommitPlan:
                 #print(f"After raw field cleanup - content: '{cleaned_response}'")
                 return json.loads(cleaned_response)
 
-
         except json.JSONDecodeError as e:
-            print(f"Error parsing cleaned JSON response: {e}")
+            _logger_trips.error("json_parse_failed | commit_plan | %s", e)
             #print(f"Original response: {response}")
             #print(f"Cleaned response: {cleaned_response}")
             raise
-
-
 
     def llm(self, prompt):
 
@@ -384,9 +367,8 @@ class CommitPlan:
 
             return response.choices[0].message
 
-
         except Exception as e:
-            print(f"Error running LLM call: {e}")
+            _logger_trips.error("llm_call_failed | commit_plan | %s", e)
             # Only print raw response if it exists
             return False
 
@@ -403,17 +385,13 @@ class CommitPlan:
             thread = self._get_context().thread
             init = self._get_context().init
 
-            # Workspaces are stored at inner (trip) level. When stacked (org-handle/org-trip),
-            # use innermost part for list_workspaces.
-            et_inner, eid_inner, th_inner = _inner_context(entity_type, entity_id, thread)
-
             # Get the workspaces in this thread
-            response = self.CHC.list_workspaces(portfolio, org, et_inner, eid_inner, th_inner)
+            response = self.CHC.list_workspaces(portfolio,org,entity_type,entity_id,thread)
             workspaces_list = response['items']
-            print('WORKSPACES_LIST >>',workspaces_list)
+            _logger_trips.debug("workspaces_list | n=%s", len(workspaces_list or []))
 
             if not workspaces_list or len(workspaces_list) == 0:
-                print('No workspaces found')
+                _logger_trips.warning("no_workspaces_found | commit_plan")
                 return {
                     'success': False,
                     'action': action,
@@ -424,7 +402,7 @@ class CommitPlan:
             # Extract cache from workspace
             workspace = workspaces_list[0]
             if 'cache' not in workspace:
-                print('No cache found in workspace')
+                _logger_trips.warning("no_cache_in_workspace | commit_plan")
                 return {
                     'success': False,
                     'action': action,
@@ -448,23 +426,21 @@ class CommitPlan:
                 output = entry.get('output') or {}
                 plan = output.get('plan')
                 intent = output.get('intent')
-                plan_and_intent = {'plan':plan,'intent':intent}
+                plan_and_intent = {'plan': plan, 'intent': intent}
                 if plan is not None:
-                    print('Plan:', plan)
+                    _logger_trips.info("commit_plan cache hit | key=%s", cache_key)
                     return {'success': True, 'action': action, 'input': '', 'output': plan_and_intent}
 
-            print(f'Cache key {cache_key} not found')
+            _logger_trips.warning("cache_miss | commit_plan | tried=%s", cache_keys)
             return {
                 'success': False,
                 'action': action,
-                'error': f'Plan with cache key {cache_key} not found in workspace',
+                'error': f'Plan not found in workspace cache (tried {cache_keys})',
                 'output': 0
             }
 
-
-
         except Exception as e:
-            print(f'Error in find_in_cache: {str(e)}')
+            _logger_trips.error("find_in_cache_failed | %s", e)
             return {
                 'success': False,
                 'action': action,
@@ -472,36 +448,28 @@ class CommitPlan:
                 'output': 0
             }
 
-
-
-
-    def add_plan_and_intent(self,payload):
+    def add_plan_and_intent(self, payload):
         function = 'add_plan_and_intent'
 
         try:
-            pr = f'add_plan_and_intent : {payload}'
-            print(pr)
-            saved = self.AGU.mutate_workspace({'plan': payload['plan'],'intent': payload['intent']})
+            _logger_trips.debug("add_plan_and_intent | plan_id=%s", (payload.get('plan') or {}).get('id'))
+            saved = self.AGU.mutate_workspace({'plan': payload['plan'], 'intent': payload['intent']})
             plan_id = payload['plan']['id']
 
             if saved:
-                return {'success':True,'function':function,'input': payload,'output':plan_id}
+                return {'success': True, 'function': function, 'input': payload, 'output': plan_id}
             else:
-                return {'success':False,'function':function,'input': payload,'output':plan_id}
+                return {'success': False, 'function': function, 'input': payload, 'output': plan_id}
 
         except Exception as e:
+            _logger_trips.error("save_plan_failed | %s", e)
             pr = f'Error in saving plan: {str(e)}'
-            print(pr)
             return {
                 'success': False,
                 'function': function,
                 'error': pr,
                 'output': 0
             }
-
-
-
-
 
     def _sync_travelers_to_trip(self, intent, context):
         """
@@ -521,7 +489,7 @@ class CommitPlan:
         ]
 
         if not real_ids:
-            print(f'[commit_plan] No real traveler_ids in intent — skipping sync')
+            _logger_trips.debug("commit_plan | no real traveler_ids — skip sync")
             return None
 
         # Extract trip_id from entity_id (format: "portfolio-tripId")
@@ -530,10 +498,10 @@ class CommitPlan:
         trip_id = '-'.join(parts[1:]) if len(parts) > 1 else None
 
         if not trip_id:
-            print(f'[commit_plan] Could not extract trip_id from entity_id: {entity_id}')
+            _logger_trips.warning("commit_plan | could not extract trip_id from entity_id")
             return None
 
-        print(f'[commit_plan] Syncing travelers to trip {trip_id}: {real_ids}')
+        _logger_trips.info("commit_plan | syncing travelers | trip=%s | ids=%s", trip_id, real_ids)
 
         from noma.handlers.add_travelers import AddTravelers
         handler = AddTravelers()
@@ -547,7 +515,7 @@ class CommitPlan:
             'thread': context.thread,
         }
         result = handler.run(payload)
-        print(f'[commit_plan] Sync travelers result: success={result.get("success")} | ids={real_ids}')
+        _logger_trips.info("commit_plan | sync travelers | success=%s", result.get("success"))
         return result
 
     def run(self, payload):
@@ -604,7 +572,6 @@ class CommitPlan:
 
         self._set_context(context)
 
-
         self.AGU = AgentUtilities(
             self.config,
             context.portfolio,
@@ -614,23 +581,14 @@ class CommitPlan:
             context.thread
         )
 
-
         results = []
 
-        plan_inline = payload.get('plan')
-        if isinstance(plan_inline, dict) and plan_inline:
-            intent_inline = payload.get('intent')
-            if not isinstance(intent_inline, dict):
-                intent_inline = {}
-            plan_and_intent = {'plan': plan_inline, 'intent': intent_inline}
-        else:
-            response_1 = self.find_in_cache()
-            results.append(response_1)
-            if not response_1['success']:
-                return {'success': False, 'output': results}
-            plan_and_intent = response_1['output']
+        response_1 = self.find_in_cache()
+        results.append(response_1)
+        if not response_1['success']:
+            return {'success': False, 'output': results}
 
-        response_2 = self.add_plan_and_intent(plan_and_intent)
+        response_2 = self.add_plan_and_intent(response_1['output'])
         results.append(response_2)
         if not response_2['success']:
             return {'success': False, 'output': results}
@@ -643,7 +601,7 @@ class CommitPlan:
             if sync_result:
                 results.append({'action': 'sync_travelers', **sync_result})
         except Exception as e:
-            print(f'[commit_plan] Traveler sync failed (non-blocking): {e}')
+            _logger_trips.warning("commit_plan | traveler sync non-blocking failure | %s", e)
 
         output = {
             'next_action':'initiate_plan',
