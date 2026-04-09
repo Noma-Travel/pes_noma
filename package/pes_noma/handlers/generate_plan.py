@@ -1442,9 +1442,11 @@ class GeneratePlan:
         Returns all explicitly mentioned names (may exceed n_travelers if the LLM found more).
         """
         prompt_text = f"""Extract the names of ALL travelers explicitly mentioned in the travel request below.
-Return ONLY a JSON array of strings with the names, e.g. ["Arthur", "Maria Silva"].
-If no names are mentioned return [].
-Do not invent names. Include every person explicitly named in the request.
+Return ONLY a JSON array of strings. Examples:
+- "Book for John and Sarah" → ["John", "Sarah"]
+- "2 adults from NYC to LA" → []
+- "Trip for me" → []
+If no names are explicitly mentioned, return []. Do not invent or infer names.
 
 Travel request: {user_message}"""
         try:
