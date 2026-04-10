@@ -2,6 +2,7 @@
 from renglo.data.data_controller import DataController
 from renglo.schd.schd_controller import SchdController
 from renglo.common import load_config
+from pes_noma.handlers.prompt_manager import PromptManager
 
 from openai import OpenAI
 from datetime import datetime
@@ -297,13 +298,20 @@ class Specialist:
         params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
         _logger_specialist.info("consent required tool=%s params=%s", tool_name, params)
 
+        pm = PromptManager(config=self.config)
+        consent_msg = pm.format_meta_instruction(
+            "consent_request",
+            tool_name=tool_name,
+            params=params,
+        ) or f"I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok."
+
         consent = {
             'commands':payload['tool_calls'],
             'interface':'binary_consent',
             'nonce': random.randint(100000, 999999),
             'message':{
                 "role": "assistant",
-                "content": f'I would like to call {tool_name} tool with the following parameters:{params}. Please confirm it is ok'
+                "content": consent_msg
             }
         }
 
@@ -345,7 +353,14 @@ class Specialist:
                     inputs = f'{current_beliefs}'
 
                 step_number = int(continuity["plan_step"])
-                intro_msg = {'role':'assistant','content':f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'}
+                pm = PromptManager(config=self.config)
+                intro_content = pm.format_meta_instruction(
+                    "step_initiating",
+                    step_number=step_number,
+                    current_desire=current_desire,
+                    inputs=inputs,
+                ) or f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'
+                intro_msg = {'role':'assistant','content': intro_content}
                 c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
                 self.AGU.save_chat(intro_msg, next = c_id)
                 #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
@@ -375,38 +390,17 @@ class Specialist:
                         action_tools = a['tools_reference']
                     break
 
-            # Optimal Path
-            optimal_path_instructions = (
-                "You have an optimal_path with numbered steps. At every turn, you must:\n"
-                "Decide which step you are currently executing (current_step_id).\n"
-                "Optionally choose the next step you want to move to (next_step_id).\n"
-                "Optionally call tools or ask the user.\n"
-                "The optimal path is a guide, not a strict pipeline. You may:\n"
-                "- Repeat a step (e.g., go from step 1 back to step 1),\n"
-                "- Go back to previous steps (e.g., from step 3 to step 1) if you need to refine parameters."
-            )
+            # Language-aware system prefix (directive, opening, current time, tone)
+            pm = PromptManager(config=self.config)
+            messages = pm.build_system_prefix(current_time=current_time)
 
-
-
-            # Meta Instructions
-            meta_instructions = {}
-            # Initial instructions
-            meta_instructions['opening_message'] = "You are an AI assistant. You can reason over conversation history, beliefs, and goals."
-            # Provide the current time
-            meta_instructions['current_time'] = f'The current time is: {current_time}'
-            # Message to answer questions from the belief system
-            meta_instructions['answer_from_belief'] = "You can reason over the message history and known facts (beliefs) to answer user questions. If the user asks a question, check the history or beliefs before asking again."
-
-            # Message array
-            messages = [
-                { "role": "system", "content": meta_instructions['opening_message']}, # META INSTRUCTIONS
-                { "role": "system", "content": meta_instructions['current_time']}, # CURRENT TIME
+            # Action-specific instructions and plan context
+            messages += [
                 { "role": "system", "content": action_instructions}, # CURRENT ACTIONS
-                { "role": "system", "content": optimal_path_instructions}, # OPTIMAL PATH INSTRUCTIONS
+                { "role": "system", "content": pm.get_optimal_path_instruction()}, # OPTIMAL PATH INSTRUCTIONS
                 # { "role": "system", "content": meta_instructions['answer_from_belief']},
                 # { "role": "system", "content": belief_str }, # BELIEF SYSTEM
                 { "role": "system", "content": current_desire }, # CURRENT_DESIRE
-
             ]
 
             # Add plan summary (includes dynamic legs for search_flights_rextur in the prompt text)
