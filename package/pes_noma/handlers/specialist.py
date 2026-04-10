@@ -122,162 +122,81 @@ class Specialist:
 
         summary_lines = ["Plan Summary:"]
 
-        # Try to get intent information from cache
-        intent_info = None
-        if workspace:
-            cache = workspace.get('cache', {})
-            # Look for generate_plan result in cache
-            for key in cache.keys():
-                if 'generate_plan' in key:
-                    plan_cache = cache.get(key, {})
-                    intent_info = plan_cache.get('output', {}).get('intent', {})
-                    break
+        # Build legs list from flight steps — needed so the agent always passes ALL legs to search tools
+        legs_array = [
+            {
+                "origin": (inp := s.get('inputs') or {}).get('from_airport_code'),
+                "destination": inp.get('to_airport_code'),
+                "date": inp.get('departure_date'),
+            }
+            for s in plan_data['steps']
+            if s.get('action') == 'quote_flight'
+            and (inp := s.get('inputs') or {}).get('from_airport_code')
+            and inp.get('to_airport_code')
+            and inp.get('departure_date')
+        ]
 
-        # Add trip-level information if available (only high-level info, not segments details)
-        if intent_info:
-            trip_type = intent_info.get('itinerary', {}).get('trip_type', 'unknown')
-            summary_lines.append(f"Trip Type: {trip_type}")
-
-            # Add hotel information if available
-            lodging = intent_info.get('itinerary', {}).get('lodging', {})
-            if lodging.get('needed', False):
-                check_in = lodging.get('check_in', 'N/A')
-                check_out = lodging.get('check_out', 'N/A')
-                location = lodging.get('location_hint', 'N/A')
-                if check_in != 'N/A' or check_out != 'N/A' or location != 'N/A':
-                    summary_lines.append(f"Hotel: Check-in {check_in}, Check-out {check_out}, Location: {location}")
-
-            # Flight segments: list all legs so the agent uses ALL of them when calling flight search tools
-            segments = intent_info.get('itinerary', {}).get('segments') or []
-            if segments:
-                summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
-                legs_array = []
-                for i, seg in enumerate(segments):
-                    origin = (seg.get('origin') or {}).get('code') or seg.get('origin') or '?'
-                    dest = (seg.get('destination') or {}).get('code') or seg.get('destination') or '?'
-                    date = seg.get('depart_date') or seg.get('date') or '?'
-                    if isinstance(origin, dict):
-                        origin = origin.get('code', '?')
-                    if isinstance(dest, dict):
-                        dest = dest.get('code', '?')
-                    summary_lines.append(f"  Segment {i}: {origin} -> {dest} on {date}")
-                    if origin != '?' and dest != '?' and date != '?':
-                        legs_array.append({"origin": origin, "destination": dest, "date": date})
-                if legs_array:
-                    summary_lines.append("")
-                    summary_lines.append("For search_flights_rextur, set the 'legs' parameter to exactly this array (copy it as-is):")
-                    summary_lines.append(json.dumps(legs_array))
-                    summary_lines.append("Use the above legs unless the user explicitly asks for something else (e.g. different dates or segments). The 'leg' parameter (0, 1, ...) only indicates which leg you are quoting in this step; 'legs' must always be the full list above.")
-                    summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. The only case where 'legs' should have a single item is when the plan has only one flight (one-way trip).")
-                summary_lines.append("")
-
+        if legs_array:
+            summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
+            for i, leg in enumerate(legs_array):
+                summary_lines.append(f"  Segment {i}: {leg['origin']} -> {leg['destination']} on {leg['date']}")
             summary_lines.append("")
+            summary_lines.append("For search_flights_rextur, set the 'legs' parameter to exactly this array (copy it as-is):")
+            summary_lines.append(json.dumps(legs_array))
+            summary_lines.append("Use the above legs unless the user explicitly asks for something else (e.g. different dates or segments). The 'leg' parameter (0, 1, ...) only indicates which leg you are quoting in this step; 'legs' must always be the full list above.")
+            summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. The only case where 'legs' should have a single item is when the plan has only one flight (one-way trip).")
+            summary_lines.append("")
+
+        STATUS_RANK = {'5': 3, '6': 2, '4': 1, '3': 0, '0': 0}
+        STATUS_LABEL = {'5': 'completed', '6': 'error', '4': 'executing', '3': 'waiting', '0': 'pending'}
+        SYMBOL = {'completed': '✓', 'error': '✗'}
+
+        state_by_id = {}
+        if state_data and state_data.get('steps'):
+            state_by_id = {str(s.get('step_id', '')): s for s in state_data['steps']}
 
         summary_lines.append(f"Total steps: {len(plan_data['steps'])}")
         summary_lines.append("")
 
         for step in plan_data['steps']:
             step_id = str(step.get('step_id', ''))
-            step_title = step.get('title', f'Step {step_id}')
-            step_action = step.get('action', 'N/A')
-            step_inputs = step.get('inputs', {})
+            step_state = state_by_id.get(step_id)
 
-            # Find corresponding state for this step
-            step_state = None
-            if state_data and state_data.get('steps'):
-                step_state = next(
-                    (s for s in state_data['steps'] if str(s.get('step_id', '')) == step_id),
-                    None
-                )
+            raw_status = str((step_state or {}).get('status', '')).lower()
+            status = 'completed' if raw_status in ('success', 'completed') else 'error' if raw_status in ('failed', 'error') else 'pending'
+            marker = ' [CURRENT]' if str(current_step_id) == step_id else ''
+            symbol = SYMBOL.get(status, '○')
 
-            # Map status
-            status = "pending"
-            if step_state:
-                step_status = str(step_state.get('status', '')).lower()
-                if step_status in ['success', 'completed']:
-                    status = "completed"
-                elif step_status in ['failed', 'error']:
-                    status = "error"
+            summary_lines.append(f"{symbol} Step {step_id}: {step.get('title', f'Step {step_id}')} [{status}]{marker}")
+            summary_lines.append(f"  Action: {step.get('action', 'N/A')}")
 
-            # Mark current step
-            is_current = str(current_step_id) == step_id
-            current_marker = " [CURRENT]" if is_current else ""
+            for k, v in (step.get('inputs') or {}).items():
+                v_str = ', '.join(str(x) for x in v) if isinstance(v, list) else str(v)
+                summary_lines.append(f"    - {k}: {v_str}")
 
-            # Build step line with action
-            status_symbol = "✓" if status == "completed" else "✗" if status == "error" else "○"
-            summary_lines.append(f"{status_symbol} Step {step_id}: {step_title} [{status}]{current_marker}")
-            summary_lines.append(f"  Action: {step_action}")
-
-            # Add detailed inputs
-            if step_inputs:
-                summary_lines.append("  Parameters:")
-                # Format inputs in a readable way
-                for key, value in step_inputs.items():
-                    if isinstance(value, list):
-                        value_str = ', '.join(str(v) for v in value)
-                    else:
-                        value_str = str(value)
-                    summary_lines.append(f"    - {key}: {value_str}")
-
-            # Add dependencies
-            depends_on = step.get('depends_on', [])
+            depends_on = step.get('depends_on') or []
             if depends_on:
                 summary_lines.append(f"  Depends on: {', '.join(str(d) for d in depends_on)}")
 
-            # Add sub-steps (tools/actions) if available
-            if step_state and step_state.get('action_log'):
-                action_log = step_state['action_log']
-                if isinstance(action_log, list):
-                    # Group by tool name (similar to front-end logic)
-                    tool_states = {}
-                    for log_entry in action_log:
-                        if not log_entry.get('type'):
-                            continue
+            # Collapse action_log to last-wins per tool (by status rank)
+            action_log = (step_state or {}).get('action_log') or []
+            tool_states = {}
+            for entry in action_log:
+                if not entry.get('type'):
+                    continue
+                tool = entry.get('tool', '*')
+                code = str(entry.get('status', '0'))
+                name = tool if tool != '*' else (entry.get('message', 'User interaction')[:50] or 'User interaction')
+                if STATUS_RANK.get(code, 0) >= STATUS_RANK.get(str((tool_states.get(tool) or {}).get('code', '0')), 0):
+                    tool_states[tool] = {'code': code, 'name': name}
 
-                        tool_name = log_entry.get('tool', '*')
-                        log_status = str(log_entry.get('status', ''))
-                        log_type = log_entry.get('type', '')
+            if tool_states:
+                summary_lines.append("  Tools executed:")
+                for t in tool_states.values():
+                    lbl = STATUS_LABEL.get(t['code'], 'pending')
+                    summary_lines.append(f"    {SYMBOL.get(lbl, '○')} {t['name']} [{lbl}]")
 
-                        # Determine entry status
-                        entry_status = "pending"
-                        if log_status == '5' or log_type == 'tool_ok':
-                            entry_status = "completed"
-                        elif log_status == '6' or log_type == 'error':
-                            entry_status = "error"
-
-                        # Keep latest state for each tool
-                        # Priority: completed (5) > error (6) > executing (4) > waiting (3) > request (0)
-                        if tool_name not in tool_states:
-                            tool_states[tool_name] = {
-                                'status': entry_status,
-                                'statusCode': log_status,
-                                'name': tool_name if tool_name != '*' else (log_entry.get('message', 'User interaction')[:50] or 'User interaction')
-                            }
-                        else:
-                            # Update if this entry represents a more advanced state
-                            current_status_code = tool_states[tool_name]['statusCode']
-                            should_update = (
-                                log_status == '5' or  # Completed is always the most advanced
-                                (log_status == '6' and entry_status == "error" and tool_states[tool_name]['status'] != "completed") or  # Error overrides pending states
-                                (log_status == '4' and (current_status_code == '3' or current_status_code == '0' or not current_status_code)) or  # Executing (4) overrides waiting (3) or request (0)
-                                (log_status == '3' and current_status_code == '0' and tool_states[tool_name]['statusCode'] != '4')  # Waiting (3) overrides request (0) if we haven't seen executing yet
-                            )
-
-                            if should_update:
-                                tool_states[tool_name] = {
-                                    'status': entry_status,
-                                    'statusCode': log_status,
-                                    'name': tool_name if tool_name != '*' else (log_entry.get('message', 'User interaction')[:50] or 'User interaction')
-                                }
-
-                    # Add sub-steps to summary
-                    if tool_states:
-                        summary_lines.append("  Tools executed:")
-                        for tool_name, tool_state in tool_states.items():
-                            sub_status_symbol = "✓" if tool_state['status'] == "completed" else "✗" if tool_state['status'] == "error" else "○"
-                            summary_lines.append(f"    {sub_status_symbol} {tool_state['name']} [{tool_state['status']}]")
-
-            summary_lines.append("")  # Empty line between steps
+            summary_lines.append("")
 
         return "\n".join(summary_lines)
 
