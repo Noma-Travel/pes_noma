@@ -2,6 +2,7 @@
 from renglo.data.data_controller import DataController
 from renglo.schd.schd_controller import SchdController
 from renglo.common import load_config
+from pes_noma.handlers.prompt_manager import PromptManager
 
 from openai import OpenAI
 from datetime import datetime
@@ -10,8 +11,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
 import json
+import logging
 import random
 import time
+
+_logger_specialist = logging.getLogger("agent.specialist")
+_logger_verify = logging.getLogger("agent.verify")
 
 class UniversalEncoder(json.JSONEncoder):
     """JSON encoder that handles Decimal, datetime, date, and other common types."""
@@ -291,6 +296,14 @@ class Specialist:
         else:
             arguments_dict = arguments
         params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
+        _logger_specialist.info("consent required tool=%s params=%s", tool_name, params)
+
+        pm = PromptManager(config=self.config)
+        consent_msg = pm.format_meta_instruction(
+            "consent_request",
+            tool_name=tool_name,
+            params=params,
+        ) or f"I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok."
 
         consent = {
             'commands':payload['tool_calls'],
@@ -298,7 +311,7 @@ class Specialist:
             'nonce': random.randint(100000, 999999),
             'message':{
                 "role": "assistant",
-                "content": f'I would like to call {tool_name} tool with the following parameters:{params}. Please confirm it is ok'
+                "content": consent_msg
             }
         }
 
@@ -311,28 +324,21 @@ class Specialist:
 
         action = 'interpret'
         self.AGU.print_chat('Interpreting message...', 'transient')
-        print('interpret')
 
         try:
-
 
             # The goal of this specialist
             # Belief (coming from the Plan)
             current_beliefs = self._get_context().inputs
             belief_str = 'Current beliefs: ' + self.AGU.string_from_object(current_beliefs)
-            print(f'Current Beliefs:{belief_str}')
             # Desire (coming from the Plan)
             current_desire = self._get_context().title
-            print(f'Current Desire:{current_desire}')
-
 
             # We get the message history directly from the source of truth to avoid missing tool id calls.
             continuity = self._get_context().continuity
-            print(continuity)
             message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
             message_list = self.AGU.get_message_history(filter=message_filter, target='llm')
 
-            print(f'Specialist Message History: {message_list}')
 
             #If the message_list comes back empty, that means the specialist execution is new. Create into message
             if not message_list['output']:
@@ -342,11 +348,18 @@ class Specialist:
                     inputs = f'{current_beliefs}'
 
                 step_number = int(continuity["plan_step"])
-                intro_msg = {'role':'assistant','content':f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'}
+                pm = PromptManager(config=self.config)
+                intro_content = pm.format_meta_instruction(
+                    "step_initiating",
+                    step_number=step_number,
+                    current_desire=current_desire,
+                    inputs=inputs,
+                ) or f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'
+                intro_msg = {'role':'assistant','content': intro_content}
                 c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
-                #self.AGU.save_chat(intro_msg, next = c_id)
+                self.AGU.save_chat(intro_msg, next = c_id)
                 #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
-                #message_list['output'].append(intro_msg)
+                message_list['output'].append(intro_msg)
 
             # Go through the message_list and replace the value of the 'content' attribute with an empty object when the role is 'tool'
             # Unless the last message it a tool response which the interpret function needs to process.
@@ -354,8 +367,6 @@ class Specialist:
 
             # Clear content from all tool messages except the last one
             message_list = self.AGU.clear_tool_message_content(message_list['output'])
-
-            print(f'Cleared Message History')
 
 
             # Get current time and date
@@ -375,38 +386,17 @@ class Specialist:
                         action_tools = a['tools_reference']
                     break
 
-            # Optimal Path
-            optimal_path_instructions = (
-                "You have an optimal_path with numbered steps. At every turn, you must:\n"
-                "Decide which step you are currently executing (current_step_id).\n"
-                "Optionally choose the next step you want to move to (next_step_id).\n"
-                "Optionally call tools or ask the user.\n"
-                "The optimal path is a guide, not a strict pipeline. You may:\n"
-                "- Repeat a step (e.g., go from step 1 back to step 1),\n"
-                "- Go back to previous steps (e.g., from step 3 to step 1) if you need to refine parameters."
-            )
+            # Language-aware system prefix (directive, opening, current time, tone)
+            pm = PromptManager(config=self.config)
+            messages = pm.build_system_prefix(current_time=current_time)
 
-
-
-            # Meta Instructions
-            meta_instructions = {}
-            # Initial instructions
-            meta_instructions['opening_message'] = "You are an AI assistant. You can reason over conversation history, beliefs, and goals."
-            # Provide the current time
-            meta_instructions['current_time'] = f'The current time is: {current_time}'
-            # Message to answer questions from the belief system
-            meta_instructions['answer_from_belief'] = "You can reason over the message history and known facts (beliefs) to answer user questions. If the user asks a question, check the history or beliefs before asking again."
-
-            # Message array
-            messages = [
-                { "role": "system", "content": meta_instructions['opening_message']}, # META INSTRUCTIONS
-                { "role": "system", "content": meta_instructions['current_time']}, # CURRENT TIME
+            # Action-specific instructions and plan context
+            messages += [
                 { "role": "system", "content": action_instructions}, # CURRENT ACTIONS
-                { "role": "system", "content": optimal_path_instructions}, # OPTIMAL PATH INSTRUCTIONS
+                { "role": "system", "content": pm.get_optimal_path_instruction()}, # OPTIMAL PATH INSTRUCTIONS
                 # { "role": "system", "content": meta_instructions['answer_from_belief']},
                 # { "role": "system", "content": belief_str }, # BELIEF SYSTEM
                 { "role": "system", "content": current_desire }, # CURRENT_DESIRE
-
             ]
 
             # Add plan summary (includes dynamic legs for search_flights_rextur in the prompt text)
@@ -421,8 +411,7 @@ class Specialist:
                     plan_summary = self._summarize_plan(plan_data, state_data, current_step_id, workspace)
                     messages.append({ "role": "system", "content": plan_summary })
             except Exception as e:
-                print(f"Error generating plan summary: {e}")
-                # Continue without plan summary if there's an error
+                _logger_specialist.warning("plan_summary_failed | %s", e)
 
             # Inject context modules configured for this action
             try:
@@ -454,6 +443,7 @@ class Specialist:
                 messages.append({ "role": "system", "content":f'In case you need them, the following tools are recommended to execute this action: {json.dumps(action_tools)}'})
 
                 approved_tools = [tool.strip() for tool in action_tools.split(',')]
+                _logger_specialist.debug("tools_disponiveis=%s", approved_tools)
 
             # Tools
             '''
@@ -490,7 +480,7 @@ class Specialist:
                         try:
                             tool_input = json.loads(t.get('input', '[]'))
                         except json.JSONDecodeError:
-                            print(f"Invalid JSON in tool input for tool {t.get('key', 'unknown')}. Using empty array.")
+                            _logger_specialist.warning("invalid json tool input tool=%s", t.get('key', 'unknown'))
                             tool_input = []
 
                         dict_params = {}
@@ -503,7 +493,6 @@ class Specialist:
                                     continue
                                 param_name = param['name']
                                 param_required = param.get('required', False)
-                                # Generic: type "array" with elements or items -> build array property
                                 if param.get('type') == 'array' and (param.get('elements') or param.get('items')):
                                     items_schema = param.get('elements') or param.get('items')
                                     prop = {
@@ -519,7 +508,6 @@ class Specialist:
                                     if param_required:
                                         required_params.append(param_name)
                                 else:
-                                    # Default: string property (backward compatible)
                                     dict_params[param_name] = {
                                         'type': 'string',
                                         'description': param.get('hint', '')
@@ -532,7 +520,6 @@ class Specialist:
                                 dict_params[key] = {'type': 'string', 'description': val}
                                 required_params.append(key)
 
-                        print(f'Required parameters:{required_params}')
 
                         tool = {
                             'type': 'function',
@@ -551,29 +538,20 @@ class Specialist:
                         list_tools.append(tool)
                         #print(f'List Tools:{list_tools}')
 
-
-            # Salva o messages e o list_tools em arquivos JSON separados para leitura
-            with open('prompt_messages.json', 'w', encoding='utf-8') as msg_file:
-                json.dump(messages, msg_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
-            with open('prompt_tools.json', 'w', encoding='utf-8') as tools_file:
-                json.dump(list_tools, tools_file, ensure_ascii=False, indent=2, cls=UniversalEncoder)
-
             # Prompt
             prompt = {
-                "model": self.AGU.AI_2_MODEL,
-                "messages": messages,
-                "tools": list_tools,
-                "temperature": 0,
-                "tool_choice": "auto"
-            }
+                    "model": self.AGU.AI_2_MODEL,
+                    "messages": messages,
+                    "tools": list_tools,
+                    "temperature": 0,
+                    "tool_choice": "auto"
+                }
 
 
             prompt = self.AGU.sanitize(prompt)
 
             #print(f'RAW PROMPT >> {prompt}')
             response = self.AGU.llm(prompt)
-            print(f'RAW RESPONSE >> {response}')
-
 
             if not response:
                 return {
@@ -603,16 +581,15 @@ class Specialist:
             # We could report every action loop to the state machine. Based on that history, we could compare it with the official optimal path to find the current state
             # We could use an auxiliary LLM call to ask what action_step are we on, based on all the data available. (but it would be better to do it programmatically)
 
-
             continuity = self._get_context().continuity
             c_id_pre = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
-
 
             if 'role' in validated_result:
 
                 if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
+                    _logger_specialist.info("tool call selected=%s", selected_tool)
 
                     # Determine if this tool requires user consent before execution
                     # Default: True (safe — requires consent unless explicitly marked otherwise)
@@ -710,7 +687,6 @@ class Specialist:
 
                     if tool_result == 'tool_error':
                         # This is the interpretation of the error message by the tool
-                        print(f'Interpret() >> The agent has interpreted the tool error:{validated_result}')
                         msg = validated_result.get('content')
 
                         self.AGU.save_chat(validated_result)
@@ -727,14 +703,13 @@ class Specialist:
                     else:
                     # This is the LLM asking something to the user.
                         if tool_result == 'fresh_results':
-                            print(f'Interpret() >> The agent has interpreted the tool results:{validated_result}')
                             c_id = self._get_context().tool_response_c_id
                             c_id_parts = c_id.split(':')
                             nonce = c_id_parts[6]
                             msg = validated_result.get('content')
                             #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
                         else:
-                            print(f'Interpret() >> The agent is asking something to the user: {validated_result}')
+                            _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
                             nonce = random.randint(100000, 999999)
                             c_id = f'{c_id_pre}:*:1:{nonce}'
                             msg = validated_result.get('content')
@@ -761,7 +736,7 @@ class Specialist:
             }
 
         except Exception as e:
-            print(f"Error in interpret() message: {e}")
+            _logger_specialist.error("interpret_failed | %s", e)
             return {
                 'success': False,
                 'action': action,
@@ -799,27 +774,28 @@ class Specialist:
             if isinstance(params, str):
                 params = json.loads(params)
             tid = command['tool_calls'][0]['id']
+            hidden_keys = {'_portfolio', '_org', '_entity_type', '_entity_id', '_thread', '_init', 'plan_id', 'plan_step', 'action_step', 'tool_step', 'continuity', 'workspace', 'state_machine'}
+            user_params = {k: v for k, v in params.items() if k not in hidden_keys}
+            _logger_specialist.info("calling tool=%s params=%s", tool_name, user_params)
 
-            print(f'tid:{tid}')
 
             if not tool_name:
                 raise ValueError("❌ No tool name provided in tool selection")
 
             print(f"Selected tool: {tool_name}")
             self.AGU.print_chat(f'Calling tool {tool_name} with parameters {params} ', 'transient')
-            print(f"Parameters: {params}")
 
             # Check if handler exists
             if tool_name not in list_handlers:
                 error_msg = f"❌ No handler found for tool '{tool_name}'"
-                print(error_msg)
+                _logger_specialist.error("handler_not_found | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
             # Check if handler is an empty string
             if list_handlers[tool_name] == '':
                 error_msg = f"❌ Handler is empty"
-                print(error_msg)
+                _logger_specialist.error("handler_empty | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -834,7 +810,7 @@ class Specialist:
             parts = handler_route.split('/')
             if len(parts) < 2 or len(parts) > 3:
                 error_msg = f"❌ {tool_name} is not a valid tool. Handler route must be 'tool/handler' or 'tool/handler/subhandler'."
-                print(error_msg)
+                _logger_specialist.error("invalid_handler_route | tool=%s | route=%s", tool_name, handler_route if 'handler_route' in dir() else '')
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -852,13 +828,15 @@ class Specialist:
             params['_thread'] = self._get_context().thread
             params['_init'] = handler_init
 
-            print(f'Calling {handler_route} ')
+            _logger_specialist.debug("calling handler route=%s", handler_route)
 
             response = self.SHC.handler_call(portfolio, org, tool, handler, params)
 
             #response = {'success':True,'output':{"some":"mockup response"}}
 
-            print(f'Handler response:{response}')
+            response_clean = {k: v for k, v in response.items() if k not in ['stack', 'output']}
+            response_clean['output_size'] = len(str(response.get('output', '')))
+            _logger_specialist.info("tool=%s returned success=%s details=%s", tool_name, response.get('success'), response_clean)
 
             #raise Exception('Troubleshooting stop')
 
@@ -874,7 +852,6 @@ class Specialist:
             # The handler determines the interface
             if 'interface' in response:
                 interface = response['interface']
-            print(f'@act:Interface:{interface}')
 
             tool_out = {
                     "role": "tool",
@@ -917,12 +894,9 @@ class Specialist:
             self.AGU.save_chat(tool_out, interface=interface, next=c_id, go_to=act_go_to)
 
 
-            print(f'act:Saved tool results to chat')
-
             # Results coming from the handler
             self._update_context(tool_response_c_id=c_id)
 
-            print(f'act:Saved tool response c_id to context')
 
             # Save handler result to workspace
 
@@ -957,10 +931,9 @@ class Specialist:
                 workspace_id=self._get_context().workspace_id
             )
 
-            print(f'flag5')
 
             #print(f'message output: {tool_out}')
-            print("✅ Tool execution complete.")
+            _logger_specialist.info("tool=%s done success=True", tool_name)
 
 
             return {"success": True, "function": function, "input": command, "output": tool_out}
@@ -987,9 +960,7 @@ class Specialist:
                 "success": False, "action": function,"input": command,"output": str(e)
             }
 
-
             return error_result
-
 
     def check(self,command):
         function = 'check'
@@ -1011,7 +982,7 @@ class Specialist:
 
             if len(parts) != 2:
                 error_msg = f"❌ {tool_name} is not a valid tool."
-                print(error_msg)
+                _logger_specialist.error("invalid_tool_route | tool=%s", tool_name)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -1065,7 +1036,6 @@ class Specialist:
 
             for a in self._get_context().list_actions:
                 if a['key'] == self._get_context().current_action:
-                    print(f'@verify:Current Action:{a}')
                     if 'verification' not in a:
                         raise Exception (f'No verification handler found for this action: {a.get("key", "N/A")}')
 
@@ -1079,7 +1049,7 @@ class Specialist:
 
             if len(parts) != 2:
                 error_msg = f"❌ {verification_handler} is not a valid verification tool."
-                print(error_msg)
+                _logger_verify.error("invalid_verification_route | handler=%s", verification_handler)
                 self.AGU.print_chat(error_msg, 'error')
                 raise ValueError(error_msg)
 
@@ -1102,6 +1072,7 @@ class Specialist:
             params['state_machine'] = workspace['state_machine'][continuity['plan_id']]
 
             response = self.SHC.handler_call(portfolio,org,parts[0],parts[1],params)
+            _logger_verify.info("verify_called | action=%s | handler=%s", action, verification_handler)
 
             if response['success']:
                 msg = f"Verification OK. Step Completed."
@@ -1116,7 +1087,7 @@ class Specialist:
                 self.AGU.mutate_workspace({'action_log': log_entry})
 
                 self.AGU.print_chat(msg,'transient')
-                print(msg)
+                _logger_verify.info("verify_result | result=SUCCESS | stop_loop=True")
 
             else:
                 output = response.get('output')
@@ -1140,9 +1111,7 @@ class Specialist:
                             "actionable":actionable
                 }
                 self.AGU.mutate_workspace({'action_log': log_entry})
-                # We don't need to record in action_log when verification is KO
-                print(msg)
-
+                _logger_verify.info("verify_result | result=FAILED | stop_loop=False")
 
             return {"success": response['success'], "action": function, "input": "", "output": response['output']}
 
@@ -1222,7 +1191,8 @@ class Specialist:
         '''
 
         action = 'run > specialist'
-        print(f'Running specialist:{payload}')
+        _logger_specialist.info("specialist started action=%s step_id=%s", payload.get('action'), payload.get('step_id'))
+
 
         # Get context from AGU if available, otherwise create new
 
@@ -1274,14 +1244,13 @@ class Specialist:
             verification_result = ''
             while loops < loop_limit:
                 loops = loops + 1
-                print(f'Loop iteration {loops}/{loop_limit}')
+                _logger_specialist.debug("loop %d/%d", loops, loop_limit)
 
 
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
                 response_1 = self.interpret(tool_result=tool_result)
                 tool_result = ''
 
-                print(f'Run() >> Response from interpret: {response_1}')
 
                 results.append(response_1)
                 if not response_1['success']:
@@ -1303,7 +1272,6 @@ class Specialist:
                     # Tool need Execution
                     # Step 2: Act. Agent runs the tool
 
-                    print(f'Run() >> Tool Execution:{response_1["output"]}')
                     response_2 = self.act(response_1['output'])
                     results.append(response_2)
                     tool_result = 'fresh_results'
@@ -1315,10 +1283,7 @@ class Specialist:
                         #return {'success':False,'action':action,'output':response_2,'stack':results}
                         tool_result = 'tool_error'
 
-
-
                         #continue
-
 
                     '''
                     # Tool returned successfully. Run tool custom checks
@@ -1345,14 +1310,12 @@ class Specialist:
                         }
 
                         self.AGU.mutate_workspace({'action_log': log_entry})
-
-
+                        print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | verification=completed")
 
                 elif 'tool_calls' not in response_1['output'] or not response_1['output']['tool_calls']:
                     # No Tool needs execution.
                     # Most likely the agent is asking for more information to fill tool parameters.
                     # Or agent is answering questions directly from the belief system.
-                    print(f'Run() >> Specialist exits because it sent a direct message to the user.')
 
                     self.AGU.print_chat(f'🤖','transient')
 
@@ -1362,10 +1325,9 @@ class Specialist:
                     output = {
                         'status':'awaiting'
                     }
+                    print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | status=awaiting")
 
                     return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
-
-
 
 
             #Gracious exit. Analyze the last tool run (act()) but you can't issue a new tool_call.
