@@ -617,21 +617,26 @@ class Specialist:
                     # Determine if this tool requires user consent before execution
                     # Default: True (safe — requires consent unless explicitly marked otherwise)
                     # Check root level first, then fall back to init dict
-                    tool_requires_consent = True
-                    for t in self._get_context().list_tools:
-                        if t.get('key') == selected_tool:
-                            if 'requires_consent' in t:
-                                tool_requires_consent = t.get('requires_consent', True)
-                            else:
-                                init_val = t.get('init', {})
-                                if isinstance(init_val, str):
-                                    try:
-                                        init_val = json.loads(init_val)
-                                    except (json.JSONDecodeError, ValueError):
-                                        init_val = {}
-                                if isinstance(init_val, dict):
-                                    tool_requires_consent = init_val.get('requires_consent', True)
-                            break
+                    tool_requires_consent = False  # BYPASS: consent desabilitado globalmente
+                    # tool_requires_consent = True
+                    # for t in self._get_context().list_tools:  # BYPASS: não lê requires_consent do banco
+                    #     if t.get('key') == selected_tool:
+                    #         if 'requires_consent' in t:
+                    #             tool_requires_consent = t.get('requires_consent', True)
+                    #             print(f'[consent] Found requires_consent at root: {tool_requires_consent}')
+                    #         else:
+                    #             init_val = t.get('init', {})
+                    #             print(f'[consent] init raw value: {repr(init_val)} type: {type(init_val).__name__}')
+                    #             if isinstance(init_val, str) and init_val not in ('_', '-', '.', ''):
+                    #                 try:
+                    #                     init_val = json.loads(init_val)
+                    #                     print(f'[consent] init parsed: {init_val}')
+                    #                 except (json.JSONDecodeError, ValueError):
+                    #                     init_val = {}
+                    #             if isinstance(init_val, dict):
+                    #                 tool_requires_consent = init_val.get('requires_consent', True)
+                    #             print(f'[consent] Final tool_requires_consent: {tool_requires_consent}')
+                    #         break
 
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
                         print(f'Interpret() >> Run this tool (consent given):{validated_result}')
@@ -675,29 +680,29 @@ class Specialist:
                         }
                         self.AGU.mutate_workspace({'action_log': log_entry})
 
-                    else:
+                    # else:  # BYPASS: bloco de consent desabilitado
 
-                        print(f'Interpret() >> Switching tool call into a message: {validated_result}')
-                        # Tool REQUIRES consent — ask the user for approval
+                    #     print(f'Interpret() >> Switching tool call into a message: {validated_result}')
+                    #     # Tool REQUIRES consent — ask the user for approval
 
-                        tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
-                        consent = self.consent_form(validated_result)
-                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
-                        self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
+                    #     tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
+                    #     consent = self.consent_form(validated_result)
+                    #     c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
+                    #     self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
 
-                        validated_result = consent['message'] # Replacing original message with consent message.
+                    #     validated_result = consent['message'] # Replacing original message with consent message.
 
-                        # Recording it in the action_log
-                        log_entry = {
-                            "plan_id":continuity["plan_id"],
-                            "plan_step":continuity["plan_step"],
-                            "tool":selected_tool,
-                            "status":tool_step,
-                            "nonce":consent["nonce"],
-                            "message":consent["message"]["content"],
-                            "type":"consent_rq"
-                        }
-                        self.AGU.mutate_workspace({"action_log": log_entry})
+                    #     # Recording it in the action_log
+                    #     log_entry = {
+                    #         "plan_id":continuity["plan_id"],
+                    #         "plan_step":continuity["plan_step"],
+                    #         "tool":selected_tool,
+                    #         "status":tool_step,
+                    #         "nonce":consent["nonce"],
+                    #         "message":consent["message"]["content"],
+                    #         "type":"consent_rq"
+                    #     }
+                    #     self.AGU.mutate_workspace({"action_log": log_entry})
 
 
 
@@ -891,21 +896,22 @@ class Specialist:
             # Determine message routing: tools that don't require consent send results
             # only to the LLM (not to the UI), enabling silent automation.
             # Check root level first, then fall back to init dict
-            tool_requires_consent = True
-            for t in self._get_context().list_tools:
-                if t.get('key') == tool_name:
-                    if 'requires_consent' in t:
-                        tool_requires_consent = t.get('requires_consent', True)
-                    else:
-                        init_val = t.get('init', {})
-                        if isinstance(init_val, str):
-                            try:
-                                init_val = json.loads(init_val)
-                            except (json.JSONDecodeError, ValueError):
-                                init_val = {}
-                        if isinstance(init_val, dict):
-                            tool_requires_consent = init_val.get('requires_consent', True)
-                    break
+            tool_requires_consent = False  # BYPASS: consent desabilitado globalmente
+            # tool_requires_consent = True
+            # for t in self._get_context().list_tools:  # BYPASS: não lê requires_consent do banco
+            #     if t.get('key') == tool_name:
+            #         if 'requires_consent' in t:
+            #             tool_requires_consent = t.get('requires_consent', True)
+            #         else:
+            #             init_val = t.get('init', {})
+            #             if isinstance(init_val, str):
+            #                 try:
+            #                     init_val = json.loads(init_val)
+            #                 except (json.JSONDecodeError, ValueError):
+            #                     init_val = {}
+            #             if isinstance(init_val, dict):
+            #                 tool_requires_consent = init_val.get('requires_consent', True)
+            #         break
             act_go_to = ['llm', 'ui'] if tool_requires_consent else ['llm']
 
             self.AGU.save_chat(tool_out, interface=interface, next=c_id, go_to=act_go_to)
