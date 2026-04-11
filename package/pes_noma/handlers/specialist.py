@@ -324,7 +324,6 @@ class Specialist:
 
         action = 'interpret'
         self.AGU.print_chat('Interpreting message...', 'transient')
-        #print('interpret') #legacy print
 
         try:
 
@@ -332,18 +331,14 @@ class Specialist:
             # Belief (coming from the Plan)
             current_beliefs = self._get_context().inputs
             belief_str = 'Current beliefs: ' + self.AGU.string_from_object(current_beliefs)
-            #print(f'Current Beliefs:{belief_str}') #legacy print
             # Desire (coming from the Plan)
             current_desire = self._get_context().title
-            # print(f'Current Desire:{current_desire}') #legacy print
 
             # We get the message history directly from the source of truth to avoid missing tool id calls.
             continuity = self._get_context().continuity
-            #print(continuity) #legacy print
             message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
             message_list = self.AGU.get_message_history(filter=message_filter)
 
-            #print(f'Specialist Message History: {message_list}') #Verboso
 
             #If the message_list comes back empty, that means the specialist execution is new. Create into message
             if not message_list['output']:
@@ -373,7 +368,6 @@ class Specialist:
             # Clear content from all tool messages except the last one
             message_list = self.AGU.clear_tool_message_content(message_list['output'])
 
-            #print(f'Cleared Message History') #Verboso
 
             # Get current time and date
             current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -506,7 +500,6 @@ class Specialist:
                                 dict_params[key] = {'type': 'string', 'description': val}
                                 required_params.append(key)
 
-                        #print(f'Required parameters:{required_params}') #legacy print
 
                         tool = {
                             'type': 'function',
@@ -539,7 +532,6 @@ class Specialist:
 
             #print(f'RAW PROMPT >> {prompt}')
             response = self.AGU.llm(prompt)
-            #print(f'RAW RESPONSE >> {response}') #Verboso
 
             if not response:
                 return {
@@ -580,7 +572,6 @@ class Specialist:
                     _logger_specialist.info("tool call selected=%s", selected_tool)
 
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
-                        #print(f'Interpret() >> Run this tool:{validated_result}') #legacy print
                         # The last message was a response to "3 = WAITING HUMAN".
                         # The continuity response matches with the selected_tool. Execute tool
 
@@ -603,7 +594,6 @@ class Specialist:
 
                     else:
 
-                        #print(f'Interpret() >> Switching tool call into a message: {validated_result}') #legacy print
                         # We are turning the tool call into a message to the user
 
                         tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
@@ -631,7 +621,6 @@ class Specialist:
 
                     if tool_result == 'tool_error':
                         # This is the interpretation of the error message by the tool
-                        #print(f'Interpret() >> The agent has interpreted the tool error:{validated_result}') #legacy print
                         msg = validated_result.get('content')
 
                         self.AGU.save_chat(validated_result)
@@ -648,14 +637,12 @@ class Specialist:
                     else:
                     # This is the LLM asking something to the user.
                         if tool_result == 'fresh_results':
-                            #print(f'Interpret() >> The agent has interpreted the tool results:{validated_result}') #Verboso
                             c_id = self._get_context().tool_response_c_id
                             c_id_parts = c_id.split(':')
                             nonce = c_id_parts[6]
                             msg = validated_result.get('content')
                             #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
                         else:
-                            #print(f'Interpret() >> The agent is asking something to the user: {validated_result}') #legacy print
                             _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
                             nonce = random.randint(100000, 999999)
                             c_id = f'{c_id_pre}:*:1:{nonce}'
@@ -725,14 +712,12 @@ class Specialist:
             user_params = {k: v for k, v in params.items() if k not in hidden_keys}
             _logger_specialist.info("calling tool=%s params=%s", tool_name, user_params)
 
-            #print(f'tid:{tid}') #legacy print
 
             if not tool_name:
                 raise ValueError("❌ No tool name provided in tool selection")
 
             print(f"Selected tool: {tool_name}")
             self.AGU.print_chat(f'Calling tool {tool_name} with parameters {params} ', 'transient')
-            #print(f"Parameters: {params}") #legacy print
 
             # Check if handler exists
             if tool_name not in list_handlers:
@@ -783,7 +768,6 @@ class Specialist:
 
             #response = {'success':True,'output':{"some":"mockup response"}}
 
-            #print(f'Handler response:{response}') #Verboso
             response_clean = {k: v for k, v in response.items() if k not in ['stack', 'output']}
             response_clean['output_size'] = len(str(response.get('output', '')))
             _logger_specialist.info("tool=%s returned success=%s details=%s", tool_name, response.get('success'), response_clean)
@@ -802,7 +786,6 @@ class Specialist:
             # The handler determines the interface
             if 'interface' in response:
                 interface = response['interface']
-            #print(f'@act:Interface:{interface}') #legacy print
 
             tool_out = {
                     "role": "tool",
@@ -823,12 +806,10 @@ class Specialist:
 
             self.AGU.save_chat(tool_out,interface=interface, next=c_id)
 
-            #print(f'act:Saved tool results to chat') #legacy print
 
             # Results coming from the handler
             self._update_context(tool_response_c_id=c_id)
 
-            #print(f'act:Saved tool response c_id to context') #legacy print
 
             # Save handler result to workspace
 
@@ -863,7 +844,6 @@ class Specialist:
                 workspace_id=self._get_context().workspace_id
             )
 
-            #print(f'flag5') #legacy print
 
             #print(f'message output: {tool_out}')
             _logger_specialist.info("tool=%s done success=True", tool_name)
@@ -969,7 +949,6 @@ class Specialist:
 
             for a in self._get_context().list_actions:
                 if a['key'] == self._get_context().current_action:
-                    #print(f'@verify:Current Action:{a}') #Verboso
                     if 'verification' not in a:
                         raise Exception (f'No verification handler found for this action: {a.get("key", "N/A")}')
 
@@ -1185,7 +1164,6 @@ class Specialist:
                 response_1 = self.interpret(tool_result=tool_result)
                 tool_result = ''
 
-                #print(f'Run() >> Response from interpret: {response_1}') #legacy print
 
                 results.append(response_1)
                 if not response_1['success']:
@@ -1207,7 +1185,6 @@ class Specialist:
                     # Tool need Execution
                     # Step 2: Act. Agent runs the tool
 
-                    #print(f'Run() >> Tool Execution:{response_1["output"]}') #legacy print
                     response_2 = self.act(response_1['output'])
                     results.append(response_2)
                     tool_result = 'fresh_results'
@@ -1252,7 +1229,6 @@ class Specialist:
                     # No Tool needs execution.
                     # Most likely the agent is asking for more information to fill tool parameters.
                     # Or agent is answering questions directly from the belief system.
-                    #print(f'Run() >> Specialist exits because it sent a direct message to the user.') #legacy print
 
                     self.AGU.print_chat(f'🤖','transient')
 

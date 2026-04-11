@@ -160,7 +160,6 @@ class ExecutePlan:
                     "output": f"Step {payload['step_id']} has no 'action' specified",
                 }
 
-            #print("Caller payload:", payload) #legacy print
 
             '''
             payload example
@@ -325,7 +324,6 @@ class ExecutePlan:
             continuity["tool_step"] = str(payload.get("tool_step", 0))
 
             workspace = self.AGU.get_active_workspace()
-            #print("Retrieving plan from active workspace:", workspace) #Verboso
 
             # Validate workspace structure
             if "plan" not in workspace:
@@ -358,7 +356,6 @@ class ExecutePlan:
                 _logger_executor.info("executing step %s: %s action=%s", step_id, step_title, step_action)
 
                 pr = f"@ step {step_id}:{step_title}"
-                #print(pr) #legacy print
                 self.AGU.print_chat(pr, "transient")
 
                 if loop > 1:
@@ -377,18 +374,15 @@ class ExecutePlan:
 
                     if step_id != continuity["plan_step"]:
                         pr = "The continuity id is pointing to a completed or non existing step. Proceeding to the active step."
-                        #print(pr) #legacy print
                         self.AGU.print_chat(pr, "transient")
                         continuity["plan_step"] = step_id
                     else:
                         pr = "The continuity id is pointing to a valid step."
-                        #print(pr) #legacy print
                         self.AGU.print_chat(pr, "transient")
 
                 # Ensure step_state exists, break if it doesn't
                 if step_id not in step_states_by_id:
                     pr = f"⚠️ Step {step_id} not found in step_states_by_id"
-                    #print(pr) #legacy print
                     self.AGU.print_chat(pr, "transient")
                     raise KeyError(f"Step ID '{step_id}' not found in State Machine")
 
@@ -397,7 +391,6 @@ class ExecutePlan:
                 if step_state["status"] in (
                     "completed"
                 ):
-                    #print(f'Skipping step. Status:{step_state["status"]}') #legacy print
                     continue
 
                 # If the last step completed successfully, it would have declared that step status as completed.
@@ -409,11 +402,9 @@ class ExecutePlan:
 
                 '''
                 # Respect dependencies
-                #print("Checking step dependencies...") #legacy print
                 if not self._dependencies_satisfied(step, step_states_by_id):
                     # At least one dependency failed or is blocked -> block this step
                     if self._dependencies_failed_or_blocked(step, step_states_by_id):
-                        #print('Step is blocked') #legacy print
 
                         # Report dependency error to state machine
                         step_status = {
@@ -429,7 +420,6 @@ class ExecutePlan:
 
                     # If dependencies are just not ready yet, skip in this pass
                     msg = "Skipping step because of dependencies..."
-                    #print(msg) #legacy print
                     continue
                 '''
 
@@ -464,7 +454,6 @@ class ExecutePlan:
 
                     # 3) Call Action
                     pr = f'Calling action:{step["action"]}'
-                    #print(pr) #legacy print
                     self.AGU.print_chat(pr, "transient")
 
                     specialist_payload = step.copy()
@@ -534,7 +523,6 @@ class ExecutePlan:
 
             # Determine overall status
             pr = f"The execution loop has been suspended. Waiting for further action"
-            #print(pr) #legacy print
             #self.AGU.print_chat(pr, "transient")
 
             '''p = {}
