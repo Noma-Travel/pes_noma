@@ -161,6 +161,11 @@ class ProposePlan:
             if not s.enter_guard:
                 s.enter_guard = "True"
             validated.append(s)
+        # Renumber step_ids sequentially after filtering
+        for i, step in enumerate(validated):
+            step.step_id = i
+            step.next_step = None if i == len(validated) - 1 else i + 1
+            step.depends_on = [i - 1] if i > 0 else []
         plan.steps = validated
         return plan
 
