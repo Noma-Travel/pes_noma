@@ -7,6 +7,7 @@ import json
 import uuid
 import datetime
 from typing import Any, Dict
+import re
 
 from renglo.common import load_config
 from renglo.agent.agent_utilities import AgentUtilities
@@ -91,6 +92,66 @@ PLAN_JSON_SCHEMA = {
 SCHEMA_TEXT = json.dumps(PLAN_JSON_SCHEMA["schema"], indent=2)
 
 MODEL = "gpt-4.1"
+IATA_CODE_RE = re.compile(r"^[A-Z]{3}$")
+PLACEHOLDER_VALUES = {"not informed", "n/a", "tbd", "unknown", "nao informado"}
+
+
+def _is_iso_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_plan(steps: Any) -> tuple[bool, str]:
+    if not isinstance(steps, list) or len(steps) == 0:
+        return False, "Plan has no steps"
+
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return False, f"Step {idx} is not an object"
+
+        action = step.get("action")
+        inputs = step.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            return False, f"Step {idx} has invalid inputs"
+
+        # Placeholder guard
+        for key, value in inputs.items():
+            if isinstance(value, str) and value.strip().lower() in PLACEHOLDER_VALUES:
+                return False, f"Step {idx} has placeholder value in {key}"
+
+        if action == "quote_flight":
+            for required in ("from_airport_code", "to_airport_code", "departure_date"):
+                if not inputs.get(required):
+                    return False, f"Step {idx} missing {required}"
+
+            if not _is_iso_date(inputs.get("departure_date")):
+                return False, f"Step {idx} has invalid departure_date format"
+
+            from_code = inputs.get("from_airport_code")
+            to_code = inputs.get("to_airport_code")
+            if not (isinstance(from_code, str) and IATA_CODE_RE.match(from_code)):
+                return False, f"Step {idx} has invalid from_airport_code"
+            if not (isinstance(to_code, str) and IATA_CODE_RE.match(to_code)):
+                return False, f"Step {idx} has invalid to_airport_code"
+
+            traveler_ids = inputs.get("traveler_ids")
+            passengers = inputs.get("passengers")
+            if isinstance(traveler_ids, list) and isinstance(passengers, int) and passengers != len(traveler_ids):
+                return False, f"Step {idx} passengers mismatch traveler_ids"
+
+        elif action == "quote_hotel":
+            for required in ("city", "check_in_date", "number_of_nights"):
+                if not inputs.get(required):
+                    return False, f"Step {idx} missing {required}"
+            if not _is_iso_date(inputs.get("check_in_date")):
+                return False, f"Step {idx} has invalid check_in_date format"
+
+    return True, ""
 
 
 # ── System prompt ────────────────────────────────────────────────────────────
@@ -201,7 +262,7 @@ class GeneratePlanFewShot:
         try:
             agu = AgentUtilities(self.config, portfolio, org, entity_type, entity_id, thread)
 
-            messages = (
+            base_messages = (
                 [{"role": "system", "content": _system_prompt()}]
                 + _few_shot_messages()
                 + [{"role": "user", "content": f"Extract the travel plan from this request:\n\n<<<\n{user_message}\n>>>"}]
@@ -209,7 +270,7 @@ class GeneratePlanFewShot:
 
             response = agu.llm({
                 "model": MODEL,
-                "messages": messages,
+                "messages": base_messages,
                 "temperature": 0,
                 "response_format": {"type": "json_schema", "json_schema": PLAN_JSON_SCHEMA},
             })
@@ -219,6 +280,42 @@ class GeneratePlanFewShot:
 
             steps_data = json.loads(response.content)
             steps = _strip_null_inputs_from_steps(steps_data.get("steps", []))
+            is_valid, validation_error = _validate_plan(steps)
+
+            if not is_valid:
+                retry_messages = base_messages + [{
+                    "role": "system",
+                    "content": (
+                        "Your previous output failed validation. "
+                        f"Validation error: {validation_error}. "
+                        "Regenerate the plan and strictly fix these issues. "
+                        "Return only JSON compliant with the schema."
+                    ),
+                }]
+                retry_response = agu.llm({
+                    "model": MODEL,
+                    "messages": retry_messages,
+                    "temperature": 0,
+                    "response_format": {"type": "json_schema", "json_schema": PLAN_JSON_SCHEMA},
+                })
+                if not retry_response:
+                    return {
+                        'success': False,
+                        'function': function,
+                        'input': payload,
+                        'output': f'Plan validation failed and retry LLM call failed: {validation_error}'
+                    }
+
+                retry_steps_data = json.loads(retry_response.content)
+                steps = _strip_null_inputs_from_steps(retry_steps_data.get("steps", []))
+                is_valid, validation_error = _validate_plan(steps)
+                if not is_valid:
+                    return {
+                        'success': False,
+                        'function': function,
+                        'input': payload,
+                        'output': f'Plan validation failed after retry: {validation_error}'
+                    }
 
             plan = {
                 "id": str(uuid.uuid4()),
