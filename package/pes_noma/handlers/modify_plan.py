@@ -8,8 +8,7 @@ import time
 import uuid
 import os
 from decimal import Decimal
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 try:
     import yaml
@@ -154,11 +153,7 @@ class IntentModifier:
             return None
         intent = copy.deepcopy(base_intent)
         intent["request"] = intent.get("request") or {}
-        try:
-            tz = ZoneInfo("America/New_York")
-        except Exception:
-            tz = ZoneInfo("America/New_York")
-        now_date = datetime.now(tz).strftime("%Y-%m-%d")
+        now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         intent["request"]["now_date"] = now_date
         intent["request"]["user_message"] = user_correction
         for change in delta.get("changes", []):
@@ -173,7 +168,7 @@ class IntentModifier:
         modification_examples = self._build_modification_examples(cases)
         prompt = prompt_template.replace("#existing_intent#", json.dumps(existing, indent=2))
         prompt = prompt.replace("#user_correction#", user_correction)
-        prompt = prompt.replace("#now_date#", datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d"))
+        prompt = prompt.replace("#now_date#", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         prompt = prompt.replace("#modification_examples#", modification_examples)
         data = self._get_llm().complete_json(prompt)
         if not data or not isinstance(data.get("changes"), list):
