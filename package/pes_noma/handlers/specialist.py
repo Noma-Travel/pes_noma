@@ -135,6 +135,12 @@ class Specialist:
             and inp.get('to_airport_code')
             and inp.get('departure_date')
         ]
+        # IMPORTANT: keep legs in chronological order (Rextur rejects out-of-order dates).
+        # Use ISO date string ordering (YYYY-MM-DD) which matches lexicographic ordering.
+        try:
+            legs_array = sorted(legs_array, key=lambda x: (str(x.get("date") or ""), str(x.get("origin") or ""), str(x.get("destination") or "")))
+        except Exception:
+            pass
 
         if legs_array:
             summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
@@ -143,6 +149,7 @@ class Specialist:
             summary_lines.append("")
             summary_lines.append("For search_flights_rextur, set the 'legs' parameter to exactly this array (copy it as-is):")
             summary_lines.append(json.dumps(legs_array))
+            summary_lines.append("The 'legs' array MUST be ordered by ascending date (earliest first).")
             summary_lines.append("Use the above legs unless the user explicitly asks for something else (e.g. different dates or segments). The 'leg' parameter (0, 1, ...) only indicates which leg you are quoting in this step; 'legs' must always be the full list above.")
             summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. The only case where 'legs' should have a single item is when the plan has only one flight (one-way trip).")
             summary_lines.append("")
