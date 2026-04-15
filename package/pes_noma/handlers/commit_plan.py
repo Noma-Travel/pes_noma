@@ -425,6 +425,7 @@ class CommitPlan:
                 cache_keys.append(f'irn:tool_rs:{init["plan_cache_key"]}')
             else:
                 cache_keys.append('irn:tool_rs:pes_noma/modify_plan')
+                cache_keys.append('irn:tool_rs:pes_noma/generate_plan_few_shot')
                 cache_keys.append('irn:tool_rs:pes_noma/generate_plan')
                 cache_keys.append('irn:tool_rs:pes/modify_plan')
                 cache_keys.append('irn:tool_rs:pes/generate_plan')
