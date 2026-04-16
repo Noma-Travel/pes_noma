@@ -337,7 +337,7 @@ class Specialist:
             # We get the message history directly from the source of truth to avoid missing tool id calls.
             continuity = self._get_context().continuity
             message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
-            message_list = self.AGU.get_message_history(filter=message_filter, target='llm')
+            message_list = self.AGU.get_message_history(filter=message_filter)
 
 
             #If the message_list comes back empty, that means the specialist execution is new. Create into message
@@ -358,7 +358,6 @@ class Specialist:
                 intro_msg = {'role':'assistant','content': intro_content}
                 c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
                 self.AGU.save_chat(intro_msg, next = c_id)
-                #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
                 message_list['output'].append(intro_msg)
 
             # Go through the message_list and replace the value of the 'content' attribute with an empty object when the role is 'tool'
@@ -430,6 +429,37 @@ class Specialist:
                             print(f"Injected context module: {module_name}")
             except Exception as e:
                 print(f"Error injecting context modules: {e}")
+
+            # NLP pos-acao: chamada LLM separada para gerar texto, sem bloquear tools
+            nlp_already_sent = False
+            if tool_result == 'fresh_results':
+                nlp_messages = list(messages)
+                nlp_messages.append({
+                    "role": "system",
+                    "content": (
+                        "You have just executed a tool and the results are displayed to the user. "
+                        "Write a short, natural message in the SAME LANGUAGE the user has been using in this conversation: "
+                        "briefly comment on what was done, then guide the user on their next step. "
+                        "Do NOT call any tools."
+                    )
+                })
+                for msg in message_list:
+                    nlp_messages.append(msg)
+                nlp_prompt = {
+                    "model": self.AGU.AI_2_MODEL,
+                    "messages": nlp_messages,
+                    "temperature": 0,
+                }
+                nlp_prompt = self.AGU.sanitize(nlp_prompt)
+                nlp_response = self.AGU.llm(nlp_prompt)
+                nlp_validation = self.AGU.validate_interpret_openai_llm_response(nlp_response)
+                if nlp_validation['success']:
+                    nlp_result = nlp_validation['output']
+                    if nlp_result.get('content') and nlp_result.get('role') == 'assistant':
+                        nlp_c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:1:{random.randint(100000, 999999)}'
+                        self.AGU.save_chat(nlp_result, next=nlp_c_id)
+                        messages.append(nlp_result)
+                        nlp_already_sent = True
 
             # Add the incoming messages
             for msg in message_list:
@@ -542,10 +572,12 @@ class Specialist:
             prompt = {
                     "model": self.AGU.AI_2_MODEL,
                     "messages": messages,
-                    "tools": list_tools,
                     "temperature": 0,
-                    "tool_choice": "auto"
                 }
+
+            if list_tools:
+                prompt["tools"] = list_tools
+                prompt["tool_choice"] = "auto"
 
 
             prompt = self.AGU.sanitize(prompt)
@@ -702,13 +734,7 @@ class Specialist:
 
                     else:
                     # This is the LLM asking something to the user.
-                        if tool_result == 'fresh_results':
-                            c_id = self._get_context().tool_response_c_id
-                            c_id_parts = c_id.split(':')
-                            nonce = c_id_parts[6]
-                            msg = validated_result.get('content')
-                            #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
-                        else:
+                        if not nlp_already_sent:
                             _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
                             nonce = random.randint(100000, 999999)
                             c_id = f'{c_id_pre}:*:1:{nonce}'
@@ -724,7 +750,6 @@ class Specialist:
                                     "nonce":nonce,
                                     "message":msg,
                                     "type":"decision_rq"
-
                             }
                             self.AGU.mutate_workspace({"action_log": log_entry})
 

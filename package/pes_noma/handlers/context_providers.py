@@ -170,7 +170,7 @@ class FullHistoryProvider(ContextProvider):
 
     def get_context(self, workspace: dict, continuity: dict, agu) -> str:
         try:
-            history_response = agu.get_message_history(target='llm')
+            history_response = agu.get_message_history()
             if not history_response.get('success'):
                 return ''
 
