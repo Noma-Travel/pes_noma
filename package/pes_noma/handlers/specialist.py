@@ -339,8 +339,17 @@ class Specialist:
             message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
             message_list = self.AGU.get_message_history(filter=message_filter)
 
+            # Detectar idioma do usuario via historico geral do chat
+            user_lang_instruction = 'Respond in the user\'s language.'
+            try:
+                general_history = self.AGU.get_message_history()
+                user_msgs = [m.get('content','') for m in general_history.get('output',[]) if m.get('role')=='user' and m.get('content')]
+                if user_msgs:
+                    user_lang_instruction = f'IMPORTANT: The user\'s language is detected from this message: "{user_msgs[-1]}". You MUST respond in that exact same language.'
+            except Exception:
+                pass
 
-            #If the message_list comes back empty, that means the specialist execution is new. Create into message
+            #If the message_list comes back empty, that means the specialist execution is new. Create intro message
             if not message_list['output']:
                 if isinstance(current_beliefs, dict):
                     inputs = ', '.join([f"{k}: {v}" for k, v in current_beliefs.items()])
@@ -348,16 +357,33 @@ class Specialist:
                     inputs = f'{current_beliefs}'
 
                 step_number = int(continuity["plan_step"])
-                pm = PromptManager(config=self.config)
-                intro_content = pm.format_meta_instruction(
-                    "step_initiating",
-                    step_number=step_number,
-                    current_desire=current_desire,
-                    inputs=inputs,
-                ) or f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'
-                intro_msg = {'role':'assistant','content': intro_content}
-                c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
-                self.AGU.save_chat(intro_msg, next = c_id)
+
+                # Gerar mensagem de inicio do step via LLM
+                nlp_intro_prompt = {
+                    "model": self.AGU.AI_2_MODEL,
+                    "messages": [
+                        {"role": "system", "content": (
+                            "You are a travel assistant. Write a single short, natural sentence. "
+                            "Tell the user what you are about to do for them based on the task and parameters. "
+                            "Be friendly and concise. Do not list raw IDs or technical fields. "
+                            + user_lang_instruction
+                        )},
+                        {"role": "user", "content": f"Task: {current_desire}\nParameters: {inputs}"}
+                    ],
+                    "temperature": 0,
+                }
+                nlp_intro_prompt = self.AGU.sanitize(nlp_intro_prompt)
+                nlp_intro_response = self.AGU.llm(nlp_intro_prompt)
+                nlp_intro_validation = self.AGU.validate_interpret_openai_llm_response(nlp_intro_response)
+
+                if nlp_intro_validation['success'] and nlp_intro_validation['output'].get('content'):
+                    intro_content = nlp_intro_validation['output']['content']
+                else:
+                    intro_content = f'Initiating step {step_number}: {current_desire}'
+
+                intro_msg = {'role': 'assistant', 'content': intro_content}
+                intro_c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:1:{random.randint(100000, 999999)}'
+                self.AGU.save_chat(intro_msg, next=intro_c_id)
                 message_list['output'].append(intro_msg)
 
             # Go through the message_list and replace the value of the 'content' attribute with an empty object when the role is 'tool'
@@ -437,10 +463,12 @@ class Specialist:
                 nlp_messages.append({
                     "role": "system",
                     "content": (
-                        "You have just executed a tool and the results are displayed to the user. "
-                        "Write a short, natural message in the SAME LANGUAGE the user has been using in this conversation: "
-                        "briefly comment on what was done, then guide the user on their next step. "
-                        "Do NOT call any tools."
+                        "You have just executed a tool and the results are displayed to the user in a visual card. "
+                        "Write a SHORT natural message (2-3 sentences max): mention the highlight (e.g. best price, number of options) "
+                        "and ask what the user wants to do next. "
+                        "Do NOT list individual results — the user already sees them in the card above. "
+                        "Do NOT call any tools. "
+                        + user_lang_instruction
                     )
                 })
                 for msg in message_list:
@@ -914,9 +942,7 @@ class Specialist:
             #             if isinstance(init_val, dict):
             #                 tool_requires_consent = init_val.get('requires_consent', True)
             #         break
-            act_go_to = ['llm', 'ui'] if tool_requires_consent else ['llm']
-
-            self.AGU.save_chat(tool_out, interface=interface, next=c_id, go_to=act_go_to)
+            self.AGU.save_chat(tool_out, interface=interface, next=c_id)
 
 
             # Results coming from the handler
