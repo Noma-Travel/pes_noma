@@ -14,6 +14,25 @@ from renglo.agent.agent_utilities import AgentUtilities
 
 # ── Structured output schema (strict mode for gpt-4.1) ──────────────────────
 
+def _strip_null_inputs(inputs: Any) -> Dict[str, Any]:
+    if not isinstance(inputs, dict) or not inputs:
+        return {}
+    return {k: v for k, v in inputs.items() if v is not None}
+
+
+def _strip_null_inputs_from_steps(steps: Any) -> Any:
+    """Post-process LLM steps: remove input keys with None values."""
+    if not isinstance(steps, list):
+        return steps
+    out = []
+    for s in steps:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        out.append({**s, "inputs": _strip_null_inputs(s.get("inputs"))})
+    return out
+
+
 PLAN_JSON_SCHEMA = {
     "name": "travel_plan_steps",
     "strict": True,
@@ -79,6 +98,8 @@ MODEL = "gpt-4.1"
 def _system_prompt() -> str:
     today = datetime.date.today().isoformat()
     return f"""Today's date is {today}.
+
+We are in 2026. All dates will be in the future.
 
 You convert free-form corporate travel requests into an ordered list of executable plan steps.
 
@@ -197,10 +218,11 @@ class GeneratePlanFewShot:
                 return {'success': False, 'function': function, 'input': payload, 'output': 'LLM call failed'}
 
             steps_data = json.loads(response.content)
+            steps = _strip_null_inputs_from_steps(steps_data.get("steps", []))
 
             plan = {
                 "id": str(uuid.uuid4()),
-                "steps": steps_data.get("steps", []),
+                "steps": steps,
                 "meta": {"strategy": "few_shot", "model": MODEL},
             }
 
