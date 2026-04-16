@@ -97,6 +97,8 @@ class Specialist:
         """
         self.AGU = agu
         self.config = load_config()
+        if agu and getattr(agu, 'config', None) and 'AGENT_LANGUAGE' in agu.config:
+            self.config['AGENT_LANGUAGE'] = agu.config['AGENT_LANGUAGE']
         self.DAC = DataController(config=self.config)
         self.SHC = SchdController(config=self.config)
 
