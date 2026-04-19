@@ -380,6 +380,14 @@ class Specialist:
         if tool_name == "search_flights_rextur" and isinstance(step_inputs, dict):
             if step_inputs.get("leg") is not None and "leg" not in params:
                 params["leg"] = step_inputs.get("leg")
+
+        # Force leg from plan step inputs for add_flight_rextur so the return leg is always
+        # stored under the correct key (e.g. "1") even when the model passes leg=0.
+        if tool_name == "add_flight_rextur" and isinstance(step_inputs, dict):
+            si_leg = step_inputs.get("leg")
+            if si_leg is not None:
+                params["leg"] = si_leg
+                _logger_spec.debug("add_flight_rextur leg overridden from step_inputs | leg=%s", si_leg)
             ob = step_inputs.get("outbound_date") or step_inputs.get("departure_date")
             if ob and not params.get("outbound_date") and not params.get("departure_date"):
                 params["outbound_date"] = ob
