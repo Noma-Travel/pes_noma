@@ -207,14 +207,61 @@ class Specialist:
         return out
 
     def _trim_tool_output_for_history(self, tool_name: str, inner_output: Any) -> Any:
-        """Shrink search results for LLM chat history; full payload stays in workspace cache."""
-        if tool_name != "search_flights_rextur":
-            return inner_output
-        if not isinstance(inner_output, dict):
-            return inner_output
-        slim = dict(inner_output)
-        slim.pop("flights", None)
-        return slim
+        """Shrink tool results for LLM chat history; full payload stays in workspace cache."""
+        if tool_name == "search_flights_rextur" and isinstance(inner_output, dict):
+            index = inner_output.get("index") if isinstance(inner_output.get("index"), dict) else {}
+            slim = {
+                "success": True,
+                "segment_keys_by_price": index.get("fares", []),
+                "total": index.get("total", 0),
+                "agent_message": inner_output.get("agent_message"),
+                "search_key": inner_output.get("search_key"),
+                "current_leg": inner_output.get("current_leg"),
+                "total_legs": inner_output.get("total_legs"),
+                "hint": (
+                    "Use `key` when calling show_options / add_flight_rextur. "
+                    "`display` carries the price breakdown per fare family. "
+                    "List is already sorted by price ascending."
+                ),
+            }
+            warning = self._suspicious_search_warning(inner_output)
+            if warning:
+                slim["WARNING"] = warning
+            return slim
+        # show_options: do NOT trim — the full output (flights dict) is saved to the chat store
+        # and is what the frontend carousel widget reads. The specialist always returns
+        # `awaiting` before this content could reach the LLM messages array, so trimming
+        # here only breaks the UI with zero LLM benefit.
+        return inner_output
+
+    @staticmethod
+    def _suspicious_search_warning(inner_output: Dict[str, Any]) -> Optional[str]:
+        """Flag when the first shown result is much pricier than the full-set minimum.
+
+        Heuristic: if top-shown > 3x index.min_price, the filter is likely too tight
+        and the model should re-search with looser args.
+        """
+        try:
+            index = inner_output.get("index") or {}
+            fares = index.get("fares") or []
+            if not isinstance(fares, list) or not fares:
+                return None
+            first = fares[0]
+            if not isinstance(first, dict):
+                return None
+            top_price = float(first.get("price") or 0)
+            min_price = float(index.get("min_price") or 0)
+            if min_price <= 0 or top_price <= 0:
+                return None
+            if top_price > 3 * min_price:
+                return (
+                    f"WARNING: top displayed option costs R${int(top_price)} but cheapest in the full "
+                    f"result set is R${int(min_price)} — filter may be too narrow. Consider re-running "
+                    "search_flights_rextur with relaxed constraints (looser time window, include more airlines)."
+                )
+        except (TypeError, ValueError):
+            return None
+        return None
 
     def _consent_message_body(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         preview_html = ""
@@ -594,7 +641,11 @@ class Specialist:
             list_tools_raw = self._load_all_tools()
             openai_tools = self._build_openai_tools(list_tools_raw, approved_keys)
 
-            mh = self.AGU.get_message_history()
+            try:
+                mh = self.AGU.get_message_history(include_internal=True)
+            except TypeError:
+                # Older AgentUtilities without include_internal flag
+                mh = self.AGU.get_message_history()
             message_list = mh.get("output") or []
             message_list = self._ensure_tool_responses_after_assistant(message_list)
             message_list = self.AGU.clear_tool_message_content(message_list, recent_tool_messages=1)
@@ -608,11 +659,26 @@ class Specialist:
                 "Use **show_options** / **ask_user** (see tools_reference) so the secretary can choose "
                 "before **add_flight_rextur**."
             )
+            react_trace_note = (
+                "REACT SCRATCHPAD REQUIRED:\n"
+                "- Before each tool call, first send a short assistant message (1–2 lines, no tool_calls) "
+                "stating what you intend to do and why. The runtime stores this as internal reasoning and "
+                "replays it back to you on the next turn — prefixed with `[reasoning]`.\n"
+                "- After each tool result, send another short assistant message evaluating whether the result "
+                "looks sensible (e.g. cheapest matches expected range; airlines/time match the ask). If it "
+                "looks wrong, plan a retry with relaxed/adjusted parameters before exposing anything to the user.\n"
+                "- If the runtime injects a message beginning with `WARNING:` into a tool result, treat it as "
+                "evidence that the tool output is suspect — reason about it and re-call the tool with better "
+                "arguments rather than passing the suspect data to show_options/add_flight.\n"
+                "- Never respond with empty content or placeholders like `🤖🤖`. Always either call a tool or "
+                "emit real reasoning / a user-facing message."
+            )
             instruction_parts = [
                 self._meta_language_directive(),
                 action_doc.get("prompt_3_reasoning_and_planning") or "",
                 action_doc.get("goal") or "",
                 search_leg_note,
+                react_trace_note,
                 f"Step title (goal): {title}",
                 f"Structured step inputs (belief): {json.dumps(step_inputs, ensure_ascii=False)}",
                 "Use tools to progress. Do not paste large flight tables in assistant text; rely on tools.",
@@ -743,8 +809,18 @@ class Specialist:
                     except (json.JSONDecodeError, TypeError):
                         content_obj = {}
 
-                    # show_options uses interface=flights_rextur for the carousel UI; still pause for tap/reply.
-                    if tool_name == "show_options":
+                    # Detect pause flag — tools can opt out to let the model chain another call.
+                    pause_flag = True
+                    if isinstance(content_obj, dict):
+                        inner_out = content_obj.get("output") if isinstance(content_obj.get("output"), dict) else None
+                        if isinstance(inner_out, dict) and "pause" in inner_out:
+                            pause_flag = bool(inner_out.get("pause"))
+                        elif "pause" in content_obj:
+                            pause_flag = bool(content_obj.get("pause"))
+
+                    # show_options uses interface=flights_rextur for the carousel UI; still pause for tap/reply
+                    # unless the tool explicitly emitted pause=false.
+                    if tool_name == "show_options" and pause_flag:
                         _logger_spec.info(
                             "specialist pause | tool=show_options interface=%s -> awaiting user",
                             iface,
@@ -752,7 +828,7 @@ class Specialist:
                         return {"success": True, "output": {"status": "awaiting"}}
 
                     awaiting_iface = {"awaiting", "options", "awaiting_lawyer_reply"}
-                    if iface in awaiting_iface:
+                    if iface in awaiting_iface and pause_flag:
                         return {"success": True, "output": {"status": "awaiting"}}
 
                     tool_content = tool_payload.get("content", "")
