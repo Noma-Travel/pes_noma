@@ -1,8 +1,8 @@
 """
-Plan continuity, execution, and tool-call helpers for the standalone pes_noma fork.
+Shared plan continuity, execution, and tool-call helpers for PES-style agents.
 
-Same behavior as ``pes.handlers.utilities``; only the default ``ExecutePlan`` import
-differs. Callers may still pass ``execute_plan_cls`` to override.
+Callers supply ``AgentUtilities``, workspace resolution, and optional hooks so
+forks (e.g. ``agent_quotes``) can keep different context wiring while sharing logic.
 """
 
 from __future__ import annotations
@@ -48,12 +48,10 @@ def _plan_state_ready(plan_state: Any) -> bool:
 
 _TERMINAL_STEP_STATUSES = frozenset({'completed', 'success'})
 
-# State-machine row statuses that count this plan step as done (execute_plan / specialist).
 PLAN_STEP_TERMINAL_STATUSES = frozenset({'completed', 'success', 'complete', 'done'})
 
 
 def step_row_status_is_terminal(status: Any) -> bool:
-    """True for common terminal spellings (case-insensitive)."""
     if status is None:
         return False
     s = str(status).strip().lower()
@@ -61,10 +59,6 @@ def step_row_status_is_terminal(status: Any) -> bool:
 
 
 def is_plan_fully_terminal(workspace: Optional[Dict[str, Any]], plan_id: str) -> bool:
-    """
-    True when every step defined on the plan document has a state_machine row
-    in a terminal status (completed / success / complete / done).
-    """
     if not workspace or not isinstance(workspace, dict) or not str(plan_id).strip():
         return False
     pid = str(plan_id).strip()
@@ -89,10 +83,6 @@ def is_plan_fully_terminal(workspace: Optional[Dict[str, Any]], plan_id: str) ->
 
 
 def mark_plan_state_machine_closed(agu: AgentUtilities, plan_id: str) -> bool:
-    """
-    Set the root state_machine document for ``plan_id`` to status ``completed``
-    when all steps are terminal. Idempotent.
-    """
     if not agu or not str(plan_id).strip():
         return False
     pid = str(plan_id).strip()
@@ -114,10 +104,6 @@ def mark_plan_state_machine_closed(agu: AgentUtilities, plan_id: str) -> bool:
 
 
 def reconcile_terminal_plan_roots(agu: AgentUtilities) -> List[str]:
-    """
-    For each plan on the workspace whose steps are all terminal, set the root
-    ``state_machine[plan_id].status`` to ``completed`` if it was stale (e.g. still pending).
-    """
     if not agu:
         return []
     ws = agu.get_active_workspace()

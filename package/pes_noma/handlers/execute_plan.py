@@ -364,6 +364,7 @@ class ExecutePlan:
             print("Starting plan execution...")
             loop = 0
             passthrough_next = None
+            specialist_output = {}
             # This is the plan_steps loop
             for step in plan["steps"]:
                 loop = loop+1
@@ -491,6 +492,8 @@ class ExecutePlan:
                     specialist_payload["continuity"] = continuity
 
                     result = self._call_specialist(specialist_payload)
+                    specialist_output = result
+                    
                     pr = f"Result after calling specialist:{result}"
                     #print(pr)
                     
@@ -581,7 +584,7 @@ class ExecutePlan:
                 "success": True,
                 "function": function,
                 "input": payload,
-                "output": '',
+                "output": specialist_output,
             }
             if passthrough_next:
                 out["next"] = passthrough_next
