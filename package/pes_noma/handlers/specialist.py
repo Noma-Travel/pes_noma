@@ -33,6 +33,8 @@ CONSENT_REQUIRED_TOOLS: Set[str] = frozenset(
 )
 
 MAX_REACT_ITERATIONS = 8
+# post_execution verifies trip DB (lawyer email sent / booking); prose-only turns never pass.
+MAX_REACT_ITERATIONS_POST_EXECUTION = 6
 _PENDING_CACHE_KEY = "irn:specialist_pending_tool"
 
 
@@ -218,12 +220,39 @@ class Specialist:
             return None
         return None
 
+    @staticmethod
+    def _consent_param_label_pt(key: str) -> str:
+        labels = {
+            "to": "E-mail do destinatário",
+            "subject": "Assunto",
+            "cc": "Cópia (CC)",
+            "confirm": "Confirmação",
+            "hint": "Indicação do voo",
+            "trip_id": "Viagem",
+            "leg": "Trecho",
+            "flights_entry": "Índice da busca",
+            "intro_text": "Texto de abertura",
+            "closing_text": "Texto de encerramento",
+        }
+        return labels.get(key, key.replace("_", " ").title())
+
+    def _consent_params_summary_pt(self, arguments: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        for k, v in sorted(arguments.items()):
+            if k.startswith("_"):
+                continue
+            if v is None or v == "":
+                continue
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False)
+            lines.append(f"• {self._consent_param_label_pt(k)}: {v}")
+        return "\n".join(lines)
+
     def _consent_message_body(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         preview_html = ""
-        preview_plain = ""
         if tool_name == "send_email_to_lawyer":
             try:
-                from noma.handlers.send_email_to_lawyer import preview_email_html, preview_email_plain
+                from noma.handlers.send_email_to_lawyer import preview_email_html
 
                 merged = {
                     **arguments,
@@ -233,25 +262,33 @@ class Specialist:
                     "_entity_id": self.AGU.entity_id,
                 }
                 preview_html = preview_email_html(merged)[:12000]
-                preview_plain = preview_email_plain(merged)[:8000]
             except Exception as e:
                 _logger_spec.warning("email_preview_failed | %s", e)
-                preview_plain = str(arguments)
-        else:
-            preview_plain = json.dumps(arguments, ensure_ascii=False, indent=2)
 
-        content_parts = [
-            f"Confirme a execução da ferramenta **{tool_name}**.",
-            "",
-            preview_plain[:6000],
-        ]
-        if preview_html and tool_name == "send_email_to_lawyer":
-            content_parts.append("\n--- Pré-visualização HTML (resumo) ---\n")
-            content_parts.append(preview_html[:4000])
+        if tool_name == "send_email_to_lawyer":
+            to_addr = str(arguments.get("to") or "(e-mail não informado)").strip()
+            content = (
+                f"Posso enviar um e-mail com as opções de voo para {to_addr}?\n\n"
+                "Confira a pré-visualização abaixo. Se estiver tudo certo, confirme para enviar."
+            )
+        elif tool_name == "book_flights_rextur":
+            summary = self._consent_params_summary_pt(arguments)
+            content = (
+                "Preciso da sua confirmação para concluir a reserva do voo.\n\n"
+                f"{summary}\n\n"
+                "Confirma que posso prosseguir?"
+            )
+        else:
+            summary = self._consent_params_summary_pt(arguments)
+            content = (
+                "Preciso da sua confirmação para executar a próxima ação no sistema.\n\n"
+                f"{summary}\n\n"
+                "Confirma que posso prosseguir?"
+            )
 
         return {
             "role": "assistant",
-            "content": "\n".join(content_parts),
+            "content": content,
             "preview_html": preview_html,
             "pending_tool": tool_name,
             "pending_arguments": arguments,
@@ -505,12 +542,13 @@ class Specialist:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         no_tools: bool = False,
+        tool_choice: str = "auto",
     ):
         prompt = {
             "model": self.AGU.AI_2_MODEL,
             "messages": messages,
             "temperature": 0,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice if tools and not no_tools else "auto",
         }
         if tools and not no_tools:
             prompt["tools"] = tools
@@ -652,6 +690,18 @@ class Specialist:
                 "Use tools to progress. Do not paste large flight tables in assistant text; rely on tools.",
                 "For user-visible questions use ask_user / show_options tools when appropriate.",
             ]
+            if action_name == "post_execution":
+                instruction_parts.append(
+                    "POST_EXECUTION GATE: Each model turn must include a tool call until this step completes. "
+                    "Verification reads the trip DB (lawyer email sent or booking confirmed). "
+                    "Plain assistant text does not satisfy verification. "
+                    "Use ask_user for user-visible Q&A; use send_email_to_lawyer (with `to`) to actually email."
+                )
+                instruction_parts.append(
+                    "send_email_to_lawyer: keep `intro_text` to a short greeting + trip/dates summary only — "
+                    "do not enumerate flights in prose (the HTML email already renders option cards per leg). "
+                    "Optional `closing_text` for a brief sign-off after the cards."
+                )
             if action_name == "post_execution" and trip_doc_flights:
                 # Count segments per leg across all flight entries
                 legs_shortlist_counts: Dict[str, int] = {}
@@ -681,14 +731,21 @@ class Specialist:
             for msg in message_list:
                 messages.append(msg)
 
+            max_iterations = (
+                MAX_REACT_ITERATIONS_POST_EXECUTION
+                if action_name == "post_execution"
+                else MAX_REACT_ITERATIONS
+            )
             iteration = 0
+            post_exec_no_tool_streak = 0
+            post_exec_verify_nudge_sent = False
 
-            while iteration < MAX_REACT_ITERATIONS:
+            while iteration < max_iterations:
                 iteration += 1
                 _logger_spec.debug(
                     "specialist loop iteration=%s/%s",
                     iteration,
-                    MAX_REACT_ITERATIONS,
+                    max_iterations,
                 )
                 # Before each LLM turn: if this action has a verifier and the trip already
                 # satisfies it (e.g. quote segment present), exit — skip further tools/chat.
@@ -704,10 +761,24 @@ class Specialist:
                         )
                         return {"success": True, "output": {"status": "completed"}}
 
+                tool_choice = "auto"
+                if (
+                    action_name == "post_execution"
+                    and openai_tools
+                    and post_exec_no_tool_streak >= 2
+                    and (action_doc.get("verification") or "").strip()
+                ):
+                    tool_choice = "required"
+                    _logger_spec.warning(
+                        "post_execution forcing tool_choice=required | no_tool_streak=%s",
+                        post_exec_no_tool_streak,
+                    )
+
                 interp = self.interpret_iteration(
                     messages,
                     openai_tools,
                     no_tools=False,
+                    tool_choice=tool_choice,
                 )
                 if not interp["success"]:
                     return {
@@ -718,6 +789,7 @@ class Specialist:
                 assistant_msg = interp["output"]
 
                 if assistant_msg.get("tool_calls"):
+                    post_exec_no_tool_streak = 0
                     raw_tcs = assistant_msg["tool_calls"]
                     if len(raw_tcs) > 1:
                         _logger_spec.warning(
@@ -834,6 +906,25 @@ class Specialist:
                                 )
                         return {"success": True, "output": {"status": "awaiting"}}
 
+                    # After send_email_to_lawyer succeeds, save email_preview canvas message
+                    if tool_name == "send_email_to_lawyer" and act_res.get("success"):
+                        try:
+                            raw_out = content_obj.get("output") if isinstance(content_obj, dict) else {}
+                            if not isinstance(raw_out, dict):
+                                raw_out = {}
+                            html_body = raw_out.get("html_body") or ""
+                            if html_body:
+                                self.AGU.save_chat(
+                                    {
+                                        "role": "tool",
+                                        "_interface": "email_preview",
+                                        "content": json.dumps({"html_body": html_body}),
+                                    },
+                                    connection_id=self.AGU.connection_id,
+                                )
+                        except Exception:
+                            pass
+
                     tool_content = tool_payload.get("content", "")
                     messages.append(cmd)
                     messages.append(
@@ -849,6 +940,7 @@ class Specialist:
                     continue
 
                 # No tool calls: internal reasoning unless user-facing allowed
+                post_exec_no_tool_streak += 1
                 content = assistant_msg.get("content") or ""
                 internal_msg = {
                     "role": "assistant",
@@ -856,7 +948,30 @@ class Specialist:
                 }
                 self.AGU.save_chat(internal_msg, msg_type="internal", connection_id=self.AGU.connection_id)
 
-                if iteration >= MAX_REACT_ITERATIONS - 1:
+                if (
+                    action_name == "post_execution"
+                    and (action_doc.get("verification") or "").strip()
+                    and not post_exec_verify_nudge_sent
+                ):
+                    v_tail = self._verify(
+                        action_name,
+                        {"plan_id": plan_id, "plan_step": step_id},
+                    )
+                    if not self._verification_succeeded(v_tail):
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "VERIFICAÇÃO: a viagem ainda não tem e-mail ao advogado registrado como enviado "
+                                    "nem reserva confirmada. Você precisa chamar uma ferramenta nesta rodada "
+                                    "(send_email_to_lawyer com `to`, ask_user, show_options ou book_flights_rextur). "
+                                    "Mensagem em texto só não atualiza o sistema — não diga que o e-mail foi enviado sem o tool."
+                                ),
+                            }
+                        )
+                        post_exec_verify_nudge_sent = True
+
+                if iteration >= max_iterations - 1:
                     user_visible = {
                         "role": "assistant",
                         "content": content

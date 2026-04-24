@@ -2,11 +2,16 @@
 Few-shot plan generator — MVP replacement for generate_plan.
 Single LLM call with 3 fixed examples + structured output.
 No intent generation. Output is a Plan compatible with commit_plan/specialist.
+
+Allowed step actions are driven by the tool definition's ``init.plan_actions`` (passed
+as ``payload["_init"]`` when invoked from the agent); when absent, both quote_flight
+and quote_hotel are allowed.
 """
+import copy
 import json
 import uuid
 import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from renglo.common import load_config
@@ -89,7 +94,50 @@ PLAN_JSON_SCHEMA = {
     },
 }
 
-SCHEMA_TEXT = json.dumps(PLAN_JSON_SCHEMA["schema"], indent=2)
+CORE_PLAN_ACTIONS = frozenset({"quote_flight", "quote_hotel"})
+
+
+def _plan_actions_from_payload(payload: Dict[str, Any]) -> Tuple[Optional[List[str]], Optional[str]]:
+    """
+    Read plan_actions from tool init (``_init`` / ``init``).
+    Returns (ordered unique actions, error_message).
+    """
+    init = payload.get("_init")
+    if init is None:
+        init = payload.get("init")
+    if init is None or init == "_" or init == "":
+        return sorted(CORE_PLAN_ACTIONS), None
+    if not isinstance(init, dict):
+        return sorted(CORE_PLAN_ACTIONS), None
+
+    raw = init.get("plan_actions")
+    if raw in (None, "", []):
+        return sorted(CORE_PLAN_ACTIONS), None
+
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, list):
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        return None, "plan_actions must be a list or comma-separated string"
+
+    allowed: List[str] = []
+    for p in parts:
+        if p in CORE_PLAN_ACTIONS and p not in allowed:
+            allowed.append(p)
+    if not allowed:
+        return None, (
+            f"No supported plan_actions in {parts!r}; "
+            f"supported: {sorted(CORE_PLAN_ACTIONS)}"
+        )
+    return allowed, None
+
+
+def _plan_json_schema_for_actions(actions: List[str]) -> Dict[str, Any]:
+    schema = copy.deepcopy(PLAN_JSON_SCHEMA)
+    schema["schema"]["properties"]["steps"]["items"]["properties"]["action"]["enum"] = list(actions)
+    return schema
+
 
 MODEL = "gpt-4.1"
 IATA_CODE_RE = re.compile(r"^[A-Z]{3}$")
@@ -106,7 +154,7 @@ def _is_iso_date(value: Any) -> bool:
         return False
 
 
-def _validate_plan(steps: Any) -> tuple[bool, str]:
+def _validate_plan(steps: Any, allowed_actions: frozenset[str]) -> tuple[bool, str]:
     if not isinstance(steps, list) or len(steps) == 0:
         return False, "Plan has no steps"
 
@@ -115,6 +163,9 @@ def _validate_plan(steps: Any) -> tuple[bool, str]:
             return False, f"Step {idx} is not an object"
 
         action = step.get("action")
+        if action not in allowed_actions:
+            return False, f"Step {idx} has action {action!r} not in allowed {sorted(allowed_actions)}"
+
         inputs = step.get("inputs") or {}
         if not isinstance(inputs, dict):
             return False, f"Step {idx} has invalid inputs"
@@ -156,35 +207,66 @@ def _validate_plan(steps: Any) -> tuple[bool, str]:
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
-def _system_prompt() -> str:
+def _system_prompt(allowed_actions: List[str]) -> str:
     today = datetime.date.today().isoformat()
+    actions_fs = frozenset(allowed_actions)
+    schema_text = json.dumps(_plan_json_schema_for_actions(allowed_actions)["schema"], indent=2)
+
+    action_lines = []
+    if "quote_flight" in actions_fs:
+        action_lines.append(
+            "- quote_flight: a single flight leg between two airports on one date for a set of travelers."
+        )
+    if "quote_hotel" in actions_fs:
+        action_lines.append(
+            "- quote_hotel: a single hotel stay in one city for a check-in date and a number of nights."
+        )
+    actions_block = "\n".join(action_lines)
+
+    rules_common = """Rules:
+- step_id is a sequential integer starting at 0.
+- depends_on is a list with the previous step_id (linear chain). The first step has [].
+- next_step is the following step_id, or null for the last step.
+- enter_guard is always the literal string "True".
+- success_criteria is always the literal string "len(result) > 0".
+- traveler_ids are short stable strings like "t1", "t2", "t3". Use t1..tN in the order travelers appear in the text.
+- Never invent extra steps. Never omit required fields (use null where allowed)."""
+
+    rules_flight = ""
+    if "quote_flight" in actions_fs:
+        rules_flight = """
+- For quote_flight: set leg=0 for outbound, leg=1 for return; for multi-city, increment leg per leg of the same group. Set city, check_in_date, number_of_nights, number_of_guests, area to null. from_airport_code and to_airport_code are 3-letter UPPERCASE IATA codes (e.g. "São Paulo"->"GRU", "New York"->"JFK", "London"->"LHR"). departure_date is ISO YYYY-MM-DD. passengers is the integer count of traveler_ids.
+- title for flights: "<FROM> to <TO> flight".
+- Emit a flight step for every distinct leg. If a subgroup flies separately, emit a separate flight step for that subgroup with only their traveler_ids."""
+
+    rules_hotel = ""
+    if "quote_hotel" in actions_fs:
+        rules_hotel = """
+- For quote_hotel: set city to the name of destination city, check_in_date as ISO date, number_of_nights and number_of_guests as STRINGS (e.g. "3", "2"). Set leg, from_airport_code, to_airport_code, departure_date, passengers to null. area is usually null.
+- title for hotels: "<CITY> hotel <N> nights (<G> guests)".
+- Emit a hotel step for every accommodation mentioned."""
+
+    scope_note = ""
+    if actions_fs == frozenset({"quote_flight"}):
+        scope_note = "\nYou ONLY emit quote_flight steps. Do not add hotel or other step types.\n"
+    elif actions_fs == frozenset({"quote_hotel"}):
+        scope_note = "\nYou ONLY emit quote_hotel steps. Do not add flight or other step types.\n"
+
     return f"""Today's date is {today}.
 
 We are in 2026. All dates will be in the future.
 
 You convert free-form corporate travel requests into an ordered list of executable plan steps.
 
-A plan is a JSON object with one key: "steps". Each step is one of two actions:
+A plan is a JSON object with one key: "steps". Each step uses one of these actions (and ONLY these):
 
-- quote_flight: a single flight leg between two airports on one date for a set of travelers.
-- quote_hotel: a single hotel stay in one city for a check-in date and a number of nights.
-
+{actions_block}
+{scope_note}
 Output MUST conform to this JSON schema exactly:
 
-{SCHEMA_TEXT}
+{schema_text}
 
-Rules:
-- step_id is a sequential integer starting at 0.
-- depends_on is a list with the previous step_id (linear chain). The first step has [].
-- next_step is the following step_id, or null for the last step.
-- enter_guard is always the literal string "True".
-- success_criteria is always the literal string "len(result) > 0".
-- For quote_flight: set leg=0 for outbound, leg=1 for return; for multi-city, increment leg per leg of the same group. Set city, check_in_date, number_of_nights, number_of_guests, area to null. from_airport_code and to_airport_code are 3-letter UPPERCASE IATA codes (e.g. "São Paulo"->"GRU", "New York"->"JFK", "London"->"LHR"). departure_date is ISO YYYY-MM-DD. passengers is the integer count of traveler_ids.
-- For quote_hotel: set city to the name of destination city, check_in_date as ISO date, number_of_nights and number_of_guests as STRINGS (e.g. "3", "2"). Set leg, from_airport_code, to_airport_code, departure_date, passengers to null. area is usually null.
-- traveler_ids are short stable strings like "t1", "t2", "t3". Use t1..tN in the order travelers appear in the text.
-- title for flights: "<FROM> to <TO> flight". For hotels: "<CITY> hotel <N> nights (<G> guests)".
-- Emit a hotel step for every accommodation mentioned. Emit a flight step for every distinct leg. If a subgroup flies separately, emit a separate flight step for that subgroup with only their traveler_ids.
-- Never invent extra steps. Never omit required fields (use null where allowed)."""
+{rules_common}{rules_flight}{rules_hotel}"""
 
 
 # ── Few-shot examples ────────────────────────────────────────────────────────
@@ -226,10 +308,66 @@ EXAMPLES = [
     },
 ]
 
+# Few-shot banks aligned with init.plan_actions (flight-only / hotel-only).
 
-def _few_shot_messages() -> list:
+EXAMPLES_FLIGHT_ONLY = [
+    {
+        "user": "Preciso de voos de ida e volta GRU-JFK para Ana Silva e Bruno Costa, saindo 10/05/2026, voltando 15/05/2026, econômica.",
+        "plan": {
+            "steps": [
+                {"step_id": 0, "action": "quote_flight", "depends_on": [], "enter_guard": "True", "next_step": 1, "success_criteria": "len(result) > 0", "title": "GRU to JFK flight", "inputs": {"leg": 0, "from_airport_code": "GRU", "to_airport_code": "JFK", "departure_date": "2026-05-10", "passengers": 2, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1", "t2"]}},
+                {"step_id": 1, "action": "quote_flight", "depends_on": [0], "enter_guard": "True", "next_step": None, "success_criteria": "len(result) > 0", "title": "JFK to GRU flight", "inputs": {"leg": 1, "from_airport_code": "JFK", "to_airport_code": "GRU", "departure_date": "2026-05-15", "passengers": 2, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1", "t2"]}},
+            ]
+        },
+    },
+    {
+        "user": "Multi-city trip for Carlos Mendes: São Paulo to Lisbon on June 3rd, then Lisbon to Madrid on June 7th, then Madrid back to São Paulo on June 12th.",
+        "plan": {
+            "steps": [
+                {"step_id": 0, "action": "quote_flight", "depends_on": [], "enter_guard": "True", "next_step": 1, "success_criteria": "len(result) > 0", "title": "GRU to LIS flight", "inputs": {"leg": 0, "from_airport_code": "GRU", "to_airport_code": "LIS", "departure_date": "2026-06-03", "passengers": 1, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1"]}},
+                {"step_id": 1, "action": "quote_flight", "depends_on": [0], "enter_guard": "True", "next_step": 2, "success_criteria": "len(result) > 0", "title": "LIS to MAD flight", "inputs": {"leg": 1, "from_airport_code": "LIS", "to_airport_code": "MAD", "departure_date": "2026-06-07", "passengers": 1, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1"]}},
+                {"step_id": 2, "action": "quote_flight", "depends_on": [1], "enter_guard": "True", "next_step": None, "success_criteria": "len(result) > 0", "title": "MAD to GRU flight", "inputs": {"leg": 2, "from_airport_code": "MAD", "to_airport_code": "GRU", "departure_date": "2026-06-12", "passengers": 1, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1"]}},
+            ]
+        },
+    },
+    {
+        "user": "Team meeting in Miami July 10-13. Diana flies from São Paulo, Eduardo and Fernanda from Rio. Return July 13.",
+        "plan": {
+            "steps": [
+                {"step_id": 0, "action": "quote_flight", "depends_on": [], "enter_guard": "True", "next_step": 1, "success_criteria": "len(result) > 0", "title": "GRU to MIA flight", "inputs": {"leg": 0, "from_airport_code": "GRU", "to_airport_code": "MIA", "departure_date": "2026-07-10", "passengers": 1, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1"]}},
+                {"step_id": 1, "action": "quote_flight", "depends_on": [0], "enter_guard": "True", "next_step": 2, "success_criteria": "len(result) > 0", "title": "GIG to MIA flight", "inputs": {"leg": 0, "from_airport_code": "GIG", "to_airport_code": "MIA", "departure_date": "2026-07-10", "passengers": 2, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t2", "t3"]}},
+                {"step_id": 2, "action": "quote_flight", "depends_on": [1], "enter_guard": "True", "next_step": 3, "success_criteria": "len(result) > 0", "title": "MIA to GRU flight", "inputs": {"leg": 1, "from_airport_code": "MIA", "to_airport_code": "GRU", "departure_date": "2026-07-13", "passengers": 1, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t1"]}},
+                {"step_id": 3, "action": "quote_flight", "depends_on": [2], "enter_guard": "True", "next_step": None, "success_criteria": "len(result) > 0", "title": "MIA to GIG flight", "inputs": {"leg": 1, "from_airport_code": "MIA", "to_airport_code": "GIG", "departure_date": "2026-07-13", "passengers": 2, "city": None, "check_in_date": None, "number_of_nights": None, "number_of_guests": None, "area": None, "traveler_ids": ["t2", "t3"]}},
+            ]
+        },
+    },
+]
+
+EXAMPLES_HOTEL_ONLY = [
+    {
+        "user": "Hotéis: 4 noites em Lisboa (check-in 2026-06-03, 1 hóspede) e 5 noites em Madrid (check-in 2026-06-07, 1 hóspede).",
+        "plan": {
+            "steps": [
+                {"step_id": 0, "action": "quote_hotel", "depends_on": [], "enter_guard": "True", "next_step": 1, "success_criteria": "len(result) > 0", "title": "Lisbon hotel 4 nights (1 guests)", "inputs": {"leg": None, "from_airport_code": None, "to_airport_code": None, "departure_date": None, "passengers": None, "city": "Lisbon", "check_in_date": "2026-06-03", "number_of_nights": "4", "number_of_guests": "1", "area": None, "traveler_ids": ["t1"]}},
+                {"step_id": 1, "action": "quote_hotel", "depends_on": [0], "enter_guard": "True", "next_step": None, "success_criteria": "len(result) > 0", "title": "Madrid hotel 5 nights (1 guests)", "inputs": {"leg": None, "from_airport_code": None, "to_airport_code": None, "departure_date": None, "passengers": None, "city": "Madrid", "check_in_date": "2026-06-07", "number_of_nights": "5", "number_of_guests": "1", "area": None, "traveler_ids": ["t1"]}},
+            ]
+        },
+    },
+]
+
+
+def _examples_for_actions(allowed_actions: List[str]) -> list:
+    fs = frozenset(allowed_actions)
+    if fs == frozenset({"quote_flight"}):
+        return EXAMPLES_FLIGHT_ONLY
+    if fs == frozenset({"quote_hotel"}):
+        return EXAMPLES_HOTEL_ONLY
+    return EXAMPLES
+
+
+def _few_shot_messages(examples: list) -> list:
     msgs = []
-    for ex in EXAMPLES:
+    for ex in examples:
         msgs.append({"role": "user", "content": f"Extract the travel plan from this request:\n\n<<<\n{ex['user']}\n>>>"})
         msgs.append({"role": "assistant", "content": json.dumps(ex["plan"], ensure_ascii=False)})
     return msgs
@@ -259,12 +397,20 @@ class GeneratePlanFewShot:
         if not user_message:
             return {'success': False, 'function': function, 'input': payload, 'output': 'No message provided'}
 
+        plan_actions, pa_err = _plan_actions_from_payload(payload)
+        if pa_err or not plan_actions:
+            return {'success': False, 'function': function, 'input': payload, 'output': pa_err or 'Invalid plan_actions'}
+
+        allowed_actions = frozenset(plan_actions)
+        plan_json_schema = _plan_json_schema_for_actions(plan_actions)
+        few_shot_bank = _examples_for_actions(plan_actions)
+
         try:
             agu = AgentUtilities(self.config, portfolio, org, entity_type, entity_id, thread)
 
             base_messages = (
-                [{"role": "system", "content": _system_prompt()}]
-                + _few_shot_messages()
+                [{"role": "system", "content": _system_prompt(plan_actions)}]
+                + _few_shot_messages(few_shot_bank)
                 + [{"role": "user", "content": f"Extract the travel plan from this request:\n\n<<<\n{user_message}\n>>>"}]
             )
 
@@ -272,7 +418,7 @@ class GeneratePlanFewShot:
                 "model": MODEL,
                 "messages": base_messages,
                 "temperature": 0,
-                "response_format": {"type": "json_schema", "json_schema": PLAN_JSON_SCHEMA},
+                "response_format": {"type": "json_schema", "json_schema": plan_json_schema},
             })
 
             if not response:
@@ -280,7 +426,7 @@ class GeneratePlanFewShot:
 
             steps_data = json.loads(response.content)
             steps = _strip_null_inputs_from_steps(steps_data.get("steps", []))
-            is_valid, validation_error = _validate_plan(steps)
+            is_valid, validation_error = _validate_plan(steps, allowed_actions)
 
             if not is_valid:
                 retry_messages = base_messages + [{
@@ -296,7 +442,7 @@ class GeneratePlanFewShot:
                     "model": MODEL,
                     "messages": retry_messages,
                     "temperature": 0,
-                    "response_format": {"type": "json_schema", "json_schema": PLAN_JSON_SCHEMA},
+                    "response_format": {"type": "json_schema", "json_schema": plan_json_schema},
                 })
                 if not retry_response:
                     return {
@@ -308,7 +454,7 @@ class GeneratePlanFewShot:
 
                 retry_steps_data = json.loads(retry_response.content)
                 steps = _strip_null_inputs_from_steps(retry_steps_data.get("steps", []))
-                is_valid, validation_error = _validate_plan(steps)
+                is_valid, validation_error = _validate_plan(steps, allowed_actions)
                 if not is_valid:
                     return {
                         'success': False,
@@ -335,7 +481,7 @@ class GeneratePlanFewShot:
             plan = {
                 "id": str(uuid.uuid4()),
                 "steps": steps,
-                "meta": {"strategy": "few_shot", "model": MODEL},
+                "meta": {"strategy": "few_shot", "model": MODEL, "plan_actions": list(plan_actions)},
             }
 
             output = {"plan": plan, "intent": None}
