@@ -161,51 +161,6 @@ class Specialist:
             "IMPORTANTE: Responda APENAS em Português do Brasil nas mensagens visíveis ao usuário."
         )
 
-    @staticmethod
-    def _ensure_tool_responses_after_assistant(
-        msgs: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        OpenAI requires every tool_call_id on an assistant message to have a following tool
-        message. Repair gaps (e.g. legacy history, trimming) with minimal JSON placeholders.
-        """
-        out: List[Dict[str, Any]] = []
-        i = 0
-        n = len(msgs)
-        while i < n:
-            m = msgs[i]
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                out.append(m)
-                req_ids: List[str] = []
-                for tc in m["tool_calls"]:
-                    if isinstance(tc, dict) and tc.get("id"):
-                        req_ids.append(str(tc["id"]))
-                i += 1
-                following: List[Dict[str, Any]] = []
-                while i < n and msgs[i].get("role") == "tool":
-                    following.append(msgs[i])
-                    i += 1
-                by_id: Dict[str, Dict[str, Any]] = {}
-                for tm in following:
-                    tid = tm.get("tool_call_id")
-                    if tid:
-                        by_id[str(tid)] = tm
-                for tid in req_ids:
-                    if tid in by_id:
-                        out.append(by_id[tid])
-                    else:
-                        out.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tid,
-                                "content": '{"error":"missing_tool_response_repaired"}',
-                            }
-                        )
-                continue
-            out.append(m)
-            i += 1
-        return out
-
     def _trim_tool_output_for_history(self, tool_name: str, inner_output: Any) -> Any:
         """Shrink tool results for LLM chat history; full payload stays in workspace cache."""
         if tool_name == "search_flights_rextur" and isinstance(inner_output, dict):
@@ -593,6 +548,7 @@ class Specialist:
 
             trip_ctx = {}
             ages = None
+            trip_doc_flights = None
             try:
                 parts_eid = (self.AGU.entity_id or "").split("-")
                 trip_id = "-".join(parts_eid[1:]) if len(parts_eid) > 1 else None
@@ -604,6 +560,9 @@ class Specialist:
                         ages = trip_doc.get("ages")
                         trip_ctx["trip_ages"] = ages
                         trip_ctx["trip_doc_present"] = True
+                        if isinstance(trip_doc.get("flights"), list):
+                            trip_doc_flights = trip_doc["flights"]
+                            trip_ctx["trip_flights"] = trip_doc_flights
             except Exception:
                 pass
 
@@ -655,7 +614,8 @@ class Specialist:
                 # Older AgentUtilities without include_internal flag
                 mh = self.AGU.get_message_history()
             message_list = mh.get("output") or []
-            message_list = self._ensure_tool_responses_after_assistant(message_list)
+            message_list = self.AGU.strip_orphan_tool_messages(message_list)
+            message_list = self.AGU.ensure_tool_responses_after_assistant(message_list)
             message_list = self.AGU.clear_tool_message_content(message_list, recent_tool_messages=1)
 
             search_leg_note = (
@@ -692,6 +652,29 @@ class Specialist:
                 "Use tools to progress. Do not paste large flight tables in assistant text; rely on tools.",
                 "For user-visible questions use ask_user / show_options tools when appropriate.",
             ]
+            if action_name == "post_execution" and trip_doc_flights:
+                # Count segments per leg across all flight entries
+                legs_shortlist_counts: Dict[str, int] = {}
+                for fe in trip_doc_flights:
+                    if not isinstance(fe, dict):
+                        continue
+                    for leg_k, segs in (fe.get("legs_shortlist") or {}).items():
+                        cnt = len(segs) if isinstance(segs, list) else (1 if segs else 0)
+                        legs_shortlist_counts[str(leg_k)] = legs_shortlist_counts.get(str(leg_k), 0) + cnt
+                has_multiple = any(v > 1 for v in legs_shortlist_counts.values())
+                send_rule = (
+                    "DECISION RULE: there are multiple flight options per leg (legs_shortlist counts: "
+                    f"{legs_shortlist_counts}). Use send_email_to_lawyer — do NOT book."
+                ) if has_multiple else (
+                    "DECISION RULE: exactly one option per leg detected. "
+                    "You MAY book directly (book_flights_rextur) if the secretary explicitly confirms, "
+                    "but send_email_to_lawyer remains the safe default."
+                )
+                instruction_parts.append(
+                    "TRIP FLIGHTS DATA (from trip document):\n"
+                    + json.dumps(trip_doc_flights, ensure_ascii=False, cls=DecimalEncoder)
+                    + f"\n\n{send_rule}"
+                )
             messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": "\n\n".join(instruction_parts)},
             ]
@@ -837,6 +820,18 @@ class Specialist:
 
                     awaiting_iface = {"awaiting", "options", "awaiting_lawyer_reply"}
                     if iface in awaiting_iface and pause_flag:
+                        if tool_name == "ask_user":
+                            inner_out = content_obj.get("output") if isinstance(content_obj, dict) else None
+                            question_text = (
+                                (isinstance(inner_out, dict) and inner_out.get("message"))
+                                or (isinstance(content_obj, dict) and content_obj.get("message"))
+                                or ""
+                            )
+                            if question_text:
+                                self.AGU.save_chat(
+                                    {"role": "assistant", "content": str(question_text)},
+                                    connection_id=self.AGU.connection_id,
+                                )
                         return {"success": True, "output": {"status": "awaiting"}}
 
                     tool_content = tool_payload.get("content", "")

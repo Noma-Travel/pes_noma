@@ -317,6 +317,21 @@ class GeneratePlanFewShot:
                         'output': f'Plan validation failed after retry: {validation_error}'
                     }
 
+            last_step_id = steps[-1]["step_id"] if steps else -1
+            post_exec_step_id = last_step_id + 1
+            if steps:
+                steps[-1]["next_step"] = post_exec_step_id
+            steps.append({
+                "step_id": post_exec_step_id,
+                "action": "post_execution",
+                "depends_on": [last_step_id] if steps else [],
+                "enter_guard": "True",
+                "next_step": None,
+                "success_criteria": "len(result) > 0",
+                "title": "Finalizar e enviar para advogado",
+                "inputs": {},
+            })
+
             plan = {
                 "id": str(uuid.uuid4()),
                 "steps": steps,
