@@ -1,990 +1,1176 @@
-"""
-ReAct specialist for a single plan step: interpret → act → verify loop.
+#
+from renglo.data.data_controller import DataController
+from renglo.schd.schd_controller import SchdController
+from renglo.common import load_config
+from pes_noma.handlers.prompt_manager import PromptManager
 
-User-visible text is tool-gated: intermediate assistant reasoning uses msg_type internal.
-Consent (preview + confirm) applies only to high-risk tools listed in CONSENT_REQUIRED_TOOLS.
-
-Blueprint source of truth:
-  Actions and tools are loaded at runtime from Dynamo/DataController::
-    ``schd_actions`` / ``schd_tools`` for the current portfolio/org.
-  Those indexes are populated from blueprint packages such as
-  ``noma_backend/extensions/backend/package/noma/actions/*.json`` and
-  ``.../tools/*.json`` — not read from disk directly on each request.
-"""
-
-from __future__ import annotations
-
+from openai import OpenAI
+from datetime import datetime
+from typing import List, Dict, Any
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from decimal import Decimal
 import json
 import logging
 import random
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set, Tuple
+import time
 
-from renglo.debug_json import djson
-
-_logger_spec = logging.getLogger("agent.specialist")
+_logger_specialist = logging.getLogger("agent.specialist")
 _logger_verify = logging.getLogger("agent.verify")
 
-CONSENT_REQUIRED_TOOLS: Set[str] = frozenset(
-    {
-        "send_email_to_lawyer",
-        "book_flights_rextur",
-    }
-)
-
-MAX_REACT_ITERATIONS = 8
-# post_execution verifies trip DB (lawyer email sent / booking); prose-only turns never pass.
-MAX_REACT_ITERATIONS_POST_EXECUTION = 6
-_PENDING_CACHE_KEY = "irn:specialist_pending_tool"
-
-
-class DecimalEncoder(json.JSONEncoder):
+class UniversalEncoder(json.JSONEncoder):
+    """JSON encoder that handles Decimal, datetime, date, and other common types."""
     def default(self, obj):
         if isinstance(obj, Decimal):
             return int(obj) if obj % 1 == 0 else float(obj)
-        return super().default(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if hasattr(obj, 'isoformat'):  # Handles date, time, and other datetime-like objects
+            return obj.isoformat()
+        if hasattr(obj, '__dict__'):  # Handle custom objects by converting to dict
+            return obj.__dict__
+        return super(UniversalEncoder, self).default(obj)
 
+# Backwards compatibility alias
+DecimalEncoder = UniversalEncoder
+
+def sanitize(obj):
+    """
+    Recursively sanitize an object to ensure it's JSON-serializable.
+    Converts Decimal to int/float, datetime to ISO string, etc.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, Decimal):
+        return int(obj) if obj % 1 == 0 else float(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if hasattr(obj, 'isoformat') and not isinstance(obj, str):  # date, time, etc.
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize(item) for item in obj]
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if hasattr(obj, '__dict__'):
+        return sanitize(obj.__dict__)
+    # Fallback: convert to string
+    return str(obj)
+
+@dataclass
+class RequestContext:
+    """Request-scoped context for agent operations."""
+    connection_id: str = ''
+    portfolio: str = ''
+    org: str = ''
+    public_user: str = ''
+    entity_type: str = ''
+    entity_id: str = ''
+    thread: str = ''
+    workspace_id: str = ''
+    chat_id: str = ''
+    workspace: Dict[str, Any] = field(default_factory=dict)
+    belief: Dict[str, Any] = field(default_factory=dict)
+    desire: str = ''
+    action: str = ''
+    plan: Dict[str, Any] = field(default_factory=dict)
+    execute_intention_results: Dict[str, Any] = field(default_factory=dict)
+    execute_intention_error: str = ''
+    completion_result: Dict[str, Any] = field(default_factory=dict)
+    list_handlers: Dict[str, Any] = field(default_factory=dict)
+    message_history: List[Dict[str, Any]] = field(default_factory=list)
+    list_actions: List[Dict[str, Any]] = field(default_factory=list)
+    list_tools: List[Dict[str, Any]] = field(default_factory=list)
+    continuity: Dict[str, Any] = field(default_factory=dict)
+    message: str = ''
+    tool_response_c_id: str = ''
+
+# Create a context variable to store the request context
+request_context: ContextVar[RequestContext] = ContextVar('request_context', default=RequestContext())
 
 class Specialist:
-    def __init__(self, agu):
+
+    def __init__(self,agu):
+        """
+        :agu: Agent Utilities
+        """
         self.AGU = agu
+        self.config = load_config()
+        if agu and getattr(agu, 'config', None) and 'AGENT_LANGUAGE' in agu.config:
+            self.config['AGENT_LANGUAGE'] = agu.config['AGENT_LANGUAGE']
+        self.DAC = DataController(config=self.config)
+        self.SHC = SchdController(config=self.config)
 
-    @staticmethod
-    def _single_leg_dict_from_step_inputs(step_inputs: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
+
+    def _get_context(self) -> RequestContext:
+        """Get the current request context."""
+        return request_context.get()
+
+    def _set_context(self, context: RequestContext):
+        """Set the current request context."""
+        request_context.set(context)
+
+    def _update_context(self, **kwargs):
+        """Update specific fields in the current request context."""
+        context = self._get_context()
+        for key, value in kwargs.items():
+            setattr(context, key, value)
+        self._set_context(context)
+
+    def _summarize_plan(self, plan_data, state_data, current_step_id, workspace=None):
         """
-        One Rextur search segment from the **current plan step** inputs only.
-        Used to override LLM tool args (legacy prompts often pass all trip legs).
+        Sumariza o plano completo em texto, mostrando o status de cada step
+        e qual step está sendo executado no momento.
+        Similar à lógica do front-end em noma_loop.tsx
         """
-        if not isinstance(step_inputs, dict):
-            return None
-        fr = (step_inputs.get("from_airport_code") or "").strip()
-        to = (step_inputs.get("to_airport_code") or "").strip()
-        dt = (
-            step_inputs.get("departure_date")
-            or step_inputs.get("outbound_date")
-            or ""
-        ).strip()
-        if not fr or not to or not dt:
-            return None
-        return [{"origin": fr, "destination": to, "date": dt}]
+        if not plan_data or not plan_data.get('steps'):
+            return "No plan available."
 
-    def _force_single_leg_search_payload(
-        self, params: Dict[str, Any], step_inputs: Optional[Dict[str, Any]]
-    ) -> None:
-        """Mutates params in place so search_flights_rextur always receives exactly one leg when step_inputs allow."""
-        one = self._single_leg_dict_from_step_inputs(step_inputs or {})
-        if not one:
-            return
-        params["legs"] = json.dumps(one)
-        params.pop("return_date", None)
+        summary_lines = ["Plan Summary:"]
 
-    # ------------------------------------------------------------------
-    # Loading action / tools (same pattern as AgentUtilities.interpret)
-    # ------------------------------------------------------------------
-    def _load_action_doc(self, action_key: str) -> Dict[str, Any]:
-        try:
-            response = self.AGU.DAC.get_a_b(self.AGU.portfolio, self.AGU.org, "schd_actions")
-            if not response.get("items"):
-                return {}
-            for a in response["items"]:
-                if a.get("key") == action_key:
-                    return a
-        except Exception as e:
-            _logger_spec.error("load_action_failed | %s", e)
-        return {}
+        STATUS_RANK = {'5': 3, '6': 2, '4': 1, '3': 0, '0': 0}
+        STATUS_LABEL = {'5': 'completed', '6': 'error', '4': 'executing', '3': 'waiting', '0': 'pending'}
+        SYMBOL = {'completed': '✓', 'error': '✗'}
 
-    def _load_all_tools(self) -> List[Dict[str, Any]]:
-        try:
-            response = self.AGU.DAC.get_a_b(self.AGU.portfolio, self.AGU.org, "schd_tools")
-            return list(response.get("items") or [])
-        except Exception as e:
-            _logger_spec.error("load_tools_failed | %s", e)
-        return []
+        state_by_id = {}
+        if state_data and state_data.get('steps'):
+            state_by_id = {str(s.get('step_id', '')): s for s in state_data['steps']}
 
-    def _approved_tool_keys(self, action_doc: Dict[str, Any]) -> List[str]:
-        ref = (action_doc.get("tools_reference") or "").strip()
-        if not ref or ref in ("_", "-", ".", ""):
-            return []
-        return [k.strip() for k in ref.split(",") if k.strip()]
+        summary_lines.append(f"Total steps: {len(plan_data['steps'])}")
+        summary_lines.append("")
 
-    def _build_openai_tools(
-        self, list_tools_raw: List[Dict[str, Any]], approved_keys: List[str]
-    ) -> List[Dict[str, Any]]:
-        available_tools: List[Dict[str, Any]] = []
-        approved = set(approved_keys)
-        for t in list_tools_raw:
-            attrs = t.get("attributes", {}) if isinstance(t, dict) else {}
-            tool_key = t.get("key") or attrs.get("key")
-            if tool_key not in approved:
-                continue
-            tool_goal = t.get("goal") or attrs.get("goal", "")
-            tool_input_raw = t.get("input") or attrs.get("input", "[]")
-            try:
-                tool_input = json.loads(tool_input_raw)
-            except (json.JSONDecodeError, TypeError):
-                tool_input = []
+        for step in plan_data['steps']:
+            step_id = str(step.get('step_id', ''))
+            step_state = state_by_id.get(step_id)
 
-            dict_params: Dict[str, Any] = {}
-            required_params: List[str] = []
+            raw_status = str((step_state or {}).get('status', '')).lower()
+            status = 'completed' if raw_status in ('success', 'completed') else 'error' if raw_status in ('failed', 'error') else 'pending'
+            marker = ' [CURRENT]' if str(current_step_id) == step_id else ''
+            symbol = SYMBOL.get(status, '○')
 
-            if isinstance(tool_input, list):
-                for param in tool_input:
-                    if isinstance(param, dict) and "name" in param and "hint" in param:
-                        pn = param["name"]
-                        dict_params[pn] = {"type": "string", "description": param.get("hint", "")}
-                        if param.get("required"):
-                            required_params.append(pn)
-            elif isinstance(tool_input, dict):
-                for key, val in tool_input.items():
-                    dict_params[key] = {"type": "string", "description": val}
-                    required_params.append(key)
+            summary_lines.append(f"{symbol} Step {step_id}: {step.get('title', f'Step {step_id}')} [{status}]{marker}")
+            summary_lines.append(f"  Action: {step.get('action', 'N/A')}")
 
-            available_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool_key or "",
-                        "description": tool_goal,
-                        "parameters": {
-                            "type": "object",
-                            "properties": dict_params,
-                            "required": required_params,
-                        },
-                    },
-                }
-            )
-        return available_tools
+            for k, v in (step.get('inputs') or {}).items():
+                v_str = ', '.join(str(x) for x in v) if isinstance(v, list) else str(v)
+                summary_lines.append(f"    - {k}: {v_str}")
 
-    def _meta_language_directive(self) -> str:
-        lang = str(self.AGU.config.get("AGENT_LANGUAGE", "pt-BR") or "pt-BR")
-        if lang.lower().startswith("en"):
-            return "IMPORTANT: Respond ONLY in English for any user-visible message."
-        return (
-            "IMPORTANTE: Responda APENAS em Português do Brasil nas mensagens visíveis ao usuário."
-        )
+            depends_on = step.get('depends_on') or []
+            if depends_on:
+                summary_lines.append(f"  Depends on: {', '.join(str(d) for d in depends_on)}")
 
-    def _trim_tool_output_for_history(self, tool_name: str, inner_output: Any) -> Any:
-        """Shrink tool results for LLM chat history; full payload stays in workspace cache."""
-        if tool_name == "search_flights_rextur" and isinstance(inner_output, dict):
-            index = inner_output.get("index") if isinstance(inner_output.get("index"), dict) else {}
-            slim = {
-                "success": True,
-                "segment_keys_by_price": index.get("fares", []),
-                "total": index.get("total", 0),
-                "agent_message": inner_output.get("agent_message"),
-                "search_key": inner_output.get("search_key"),
-                "current_leg": inner_output.get("current_leg"),
-                "total_legs": inner_output.get("total_legs"),
-                "hint": (
-                    "Use `key` when calling show_options / add_flight_rextur. "
-                    "`display` carries the price breakdown per fare family. "
-                    "List is already sorted by price ascending."
-                ),
-            }
-            warning = self._suspicious_search_warning(inner_output)
-            if warning:
-                slim["WARNING"] = warning
-            return slim
-        # show_options: do NOT trim — the full output (flights dict) is saved to the chat store
-        # and is what the frontend carousel widget reads. The specialist always returns
-        # `awaiting` before this content could reach the LLM messages array, so trimming
-        # here only breaks the UI with zero LLM benefit.
-        return inner_output
+            # Collapse action_log to last-wins per tool (by status rank)
+            action_log = (step_state or {}).get('action_log') or []
+            tool_states = {}
+            for entry in action_log:
+                if not entry.get('type'):
+                    continue
+                tool = entry.get('tool', '*')
+                code = str(entry.get('status', '0'))
+                name = tool if tool != '*' else (entry.get('message', 'User interaction')[:50] or 'User interaction')
+                if STATUS_RANK.get(code, 0) >= STATUS_RANK.get(str((tool_states.get(tool) or {}).get('code', '0')), 0):
+                    tool_states[tool] = {'code': code, 'name': name}
 
-    @staticmethod
-    def _suspicious_search_warning(inner_output: Dict[str, Any]) -> Optional[str]:
-        """Flag when the first shown result is much pricier than the full-set minimum.
+            if tool_states:
+                summary_lines.append("  Tools executed:")
+                for t in tool_states.values():
+                    lbl = STATUS_LABEL.get(t['code'], 'pending')
+                    summary_lines.append(f"    {SYMBOL.get(lbl, '○')} {t['name']} [{lbl}]")
 
-        Heuristic: if top-shown > 3x index.min_price, the filter is likely too tight
-        and the model should re-search with looser args.
-        """
-        try:
-            index = inner_output.get("index") or {}
-            fares = index.get("fares") or []
-            if not isinstance(fares, list) or not fares:
-                return None
-            first = fares[0]
-            if not isinstance(first, dict):
-                return None
-            top_price = float(first.get("price") or 0)
-            min_price = float(index.get("min_price") or 0)
-            if min_price <= 0 or top_price <= 0:
-                return None
-            if top_price > 3 * min_price:
-                return (
-                    f"WARNING: top displayed option costs R${int(top_price)} but cheapest in the full "
-                    f"result set is R${int(min_price)} — filter may be too narrow. Consider re-running "
-                    "search_flights_rextur with relaxed constraints (looser time window, include more airlines)."
-                )
-        except (TypeError, ValueError):
-            return None
-        return None
+            summary_lines.append("")
 
-    @staticmethod
-    def _consent_param_label_pt(key: str) -> str:
-        labels = {
-            "to": "E-mail do destinatário",
-            "subject": "Assunto",
-            "cc": "Cópia (CC)",
-            "confirm": "Confirmação",
-            "hint": "Indicação do voo",
-            "trip_id": "Viagem",
-            "leg": "Trecho",
-            "flights_entry": "Índice da busca",
-            "intro_text": "Texto de abertura",
-            "closing_text": "Texto de encerramento",
-        }
-        return labels.get(key, key.replace("_", " ").title())
+        return "\n".join(summary_lines)
 
-    def _consent_params_summary_pt(self, arguments: Dict[str, Any]) -> str:
-        lines: List[str] = []
-        for k, v in sorted(arguments.items()):
-            if k.startswith("_"):
-                continue
-            if v is None or v == "":
-                continue
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            lines.append(f"• {self._consent_param_label_pt(k)}: {v}")
-        return "\n".join(lines)
+    def consent_form(self,payload):
+        function = 'consent_form'
 
-    def _consent_message_body(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        preview_html = ""
-        if tool_name == "send_email_to_lawyer":
-            try:
-                from noma.handlers.send_email_to_lawyer import preview_email_html
-
-                merged = {
-                    **arguments,
-                    "_portfolio": self.AGU.portfolio,
-                    "_org": self.AGU.org,
-                    "_entity_type": self.AGU.entity_type,
-                    "_entity_id": self.AGU.entity_id,
-                }
-                preview_html = preview_email_html(merged)[:12000]
-            except Exception as e:
-                _logger_spec.warning("email_preview_failed | %s", e)
-
-        if tool_name == "send_email_to_lawyer":
-            to_addr = str(arguments.get("to") or "(e-mail não informado)").strip()
-            content = (
-                f"Posso enviar um e-mail com as opções de voo para {to_addr}?\n\n"
-                "Confira a pré-visualização abaixo. Se estiver tudo certo, confirme para enviar."
-            )
-        elif tool_name == "book_flights_rextur":
-            summary = self._consent_params_summary_pt(arguments)
-            content = (
-                "Preciso da sua confirmação para concluir a reserva do voo.\n\n"
-                f"{summary}\n\n"
-                "Confirma que posso prosseguir?"
-            )
+        tool_name = payload['tool_calls'][0]['function']['name']
+        arguments = payload['tool_calls'][0]['function']['arguments']
+        if isinstance(arguments, str):
+            arguments_dict = json.loads(arguments)
         else:
-            summary = self._consent_params_summary_pt(arguments)
-            content = (
-                "Preciso da sua confirmação para executar a próxima ação no sistema.\n\n"
-                f"{summary}\n\n"
-                "Confirma que posso prosseguir?"
-            )
+            arguments_dict = arguments
+        params = ', '.join([f"{k}: {v}" for k, v in arguments_dict.items()])
+        _logger_specialist.info("consent required tool=%s params=%s", tool_name, params)
 
-        return {
-            "role": "assistant",
-            "content": content,
-            "preview_html": preview_html,
-            "pending_tool": tool_name,
-            "pending_arguments": arguments,
+        pm = PromptManager(config=self.config)
+        consent_msg = pm.format_meta_instruction(
+            "consent_request",
+            tool_name=tool_name,
+            params=params,
+        ) or f"I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok."
+
+        consent = {
+            'commands':payload['tool_calls'],
+            'interface':'binary_consent',
+            'nonce': random.randint(100000, 999999),
+            'message':{
+                "role": "assistant",
+                "content": consent_msg
+            }
         }
 
-    def _get_pending_from_workspace(self, workspace: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        cache = workspace.get("cache") or {}
-        raw = cache.get(_PENDING_CACHE_KEY)
-        if isinstance(raw, dict) and raw.get("plan_id") is not None:
-            return raw
-        return None
+        return consent
 
-    def _set_pending_tool(self, pending: Optional[Dict[str, Any]], workspace_id: Optional[str]) -> None:
-        self.AGU.mutate_workspace(
-            {"cache": {_PENDING_CACHE_KEY: pending}},
-            workspace_id=workspace_id,
-        )
+    def interpret(self,no_tools=False,tool_result=False):
 
-    # ------------------------------------------------------------------
-    def _act(
-        self,
-        execution_request: Dict[str, Any],
-        list_tools_raw: List[Dict[str, Any]],
-        extra: Optional[Dict[str, Any]] = None,
-        trim_for_chat: bool = True,
-    ) -> Dict[str, Any]:
-        action = "act"
-        list_handlers: Dict[str, str] = {}
-        list_inits: Dict[str, Any] = {}
+        action = 'interpret'
+        self.AGU.print_chat('Interpreting message...', 'transient')
+
+        try:
+
+            # The goal of this specialist
+            # Belief (coming from the Plan)
+            current_beliefs = self._get_context().inputs
+            belief_str = 'Current beliefs: ' + self.AGU.string_from_object(current_beliefs)
+            # Desire (coming from the Plan)
+            current_desire = self._get_context().title
+
+            # We get the message history directly from the source of truth to avoid missing tool id calls.
+            continuity = self._get_context().continuity
+            message_filter = {'param':'_next','begins_with':f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'}
+            message_list = self.AGU.get_message_history(filter=message_filter)
+
+
+            #If the message_list comes back empty, that means the specialist execution is new. Create into message
+            if not message_list['output']:
+                if isinstance(current_beliefs, dict):
+                    inputs = ', '.join([f"{k}: {v}" for k, v in current_beliefs.items()])
+                else:
+                    inputs = f'{current_beliefs}'
+
+                step_number = int(continuity["plan_step"])
+                pm = PromptManager(config=self.config)
+                intro_content = pm.format_meta_instruction(
+                    "step_initiating",
+                    step_number=step_number,
+                    current_desire=current_desire,
+                    inputs=inputs,
+                ) or f'Initiating step {step_number}. {current_desire} with the following parameters: {inputs}'
+                intro_msg = {'role':'assistant','content': intro_content}
+                c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
+                self.AGU.save_chat(intro_msg, next = c_id)
+                #message_list['output'].append({'_type':'text','_next':c_id,'_out':intro_msg})
+                message_list['output'].append(intro_msg)
+
+            # Go through the message_list and replace the value of the 'content' attribute with an empty object when the role is 'tool'
+            # Unless the last message it a tool response which the interpret function needs to process.
+            # The reason is that we don't want to overwhelm the LLM with the contents of the history of tool outputs.
+
+            # Clear content from all tool messages except the last one
+            message_list = self.AGU.clear_tool_message_content(message_list['output'])
+
+
+            # Get current time and date
+            current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+            action_instructions = ''
+            action_tools = ''
+            list_actions = self._get_context().list_actions
+
+            for a in list_actions:
+                if a['key'] == self._get_context().current_action:
+                    action_instructions = a['prompt_3_reasoning_and_planning']
+
+                    if 'tools_reference' in a and a['tools_reference'] and a['tools_reference'] not in ['_','-','.']:
+                        action_tools = a['tools_reference']
+                    break
+
+            # Language-aware system prefix (directive, opening, current time, tone)
+            pm = PromptManager(config=self.config)
+            messages = pm.build_system_prefix(current_time=current_time)
+
+            # Action-specific instructions and plan context
+            messages += [
+                { "role": "system", "content": action_instructions}, # CURRENT ACTIONS
+                { "role": "system", "content": pm.get_optimal_path_instruction()}, # OPTIMAL PATH INSTRUCTIONS
+                # { "role": "system", "content": meta_instructions['answer_from_belief']},
+                # { "role": "system", "content": belief_str }, # BELIEF SYSTEM
+                { "role": "system", "content": current_desire }, # CURRENT_DESIRE
+            ]
+
+            # Add plan summary (includes dynamic legs for search_flights_rextur in the prompt text)
+            try:
+                workspace = self.AGU.get_active_workspace()
+                plan_id = continuity.get('plan_id', '')
+                current_step_id = continuity.get('plan_step', '')
+
+                if workspace and plan_id and plan_id in workspace.get('plan', {}):
+                    plan_data = workspace['plan'][plan_id]
+                    state_data = workspace.get('state_machine', {}).get(plan_id, {})
+                    plan_summary = self._summarize_plan(plan_data, state_data, current_step_id, workspace)
+                    messages.append({ "role": "system", "content": plan_summary })
+            except Exception as e:
+                _logger_specialist.warning("plan_summary_failed | %s", e)
+
+            # Add the incoming messages
+            for msg in message_list:
+                messages.append(msg)
+
+            # Initialize approved_tools with default empty list
+            approved_tools = []
+
+            # Request asking the recommended tools for this action
+            if action_tools and not no_tools:
+                messages.append({ "role": "system", "content":f'In case you need them, the following tools are recommended to execute this action: {json.dumps(action_tools)}'})
+
+                approved_tools = [tool.strip() for tool in action_tools.split(',')]
+                _logger_specialist.debug("tools_disponiveis=%s", approved_tools)
+
+            # Tools
+            '''
+            tool.input should look like this in the database:
+
+                {
+                    "origin": {
+                        "type": "string",
+                        "description": "The departure city code or name",
+                        "required":true
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "The arrival city code or name",
+                        "required":true
+                    }
+                }
+            '''
+
+
+            if no_tools:
+                list_tools = None
+
+            else:
+                list_tools_raw = self._get_context().list_tools
+
+                #print(f'List Tools:{list_tools_raw}')
+
+                list_tools = []
+                for t in list_tools_raw:
+
+                    if t.get('key') in approved_tools:
+                        # Parse the escaped JSON string into a Python object
+                        try:
+                            tool_input = json.loads(t.get('input', '[]'))
+                        except json.JSONDecodeError:
+                            _logger_specialist.warning("invalid json tool input tool=%s", t.get('key', 'unknown'))
+                            tool_input = []
+
+                        dict_params = {}
+                        required_params = []
+
+                        # Handle new format: array of objects with name, hint, required; optional type "array" with elements/items
+                        if isinstance(tool_input, list):
+                            for param in tool_input:
+                                if not isinstance(param, dict) or 'name' not in param:
+                                    continue
+                                param_name = param['name']
+                                param_required = param.get('required', False)
+                                if param.get('type') == 'array' and (param.get('elements') or param.get('items')):
+                                    items_schema = param.get('elements') or param.get('items')
+                                    prop = {
+                                        'type': 'array',
+                                        'description': param.get('hint') or param.get('description', ''),
+                                        'items': items_schema
+                                    }
+                                    if 'minItems' in param:
+                                        prop['minItems'] = param['minItems']
+                                    if 'maxItems' in param:
+                                        prop['maxItems'] = param['maxItems']
+                                    dict_params[param_name] = prop
+                                    if param_required:
+                                        required_params.append(param_name)
+                                else:
+                                    dict_params[param_name] = {
+                                        'type': 'string',
+                                        'description': param.get('hint', '')
+                                    }
+                                    if param_required:
+                                        required_params.append(param_name)
+                        # Handle old format for backward compatibility
+                        elif isinstance(tool_input, dict):
+                            for key, val in tool_input.items():
+                                dict_params[key] = {'type': 'string', 'description': val}
+                                required_params.append(key)
+
+
+                        tool = {
+                            'type': 'function',
+                            'function': {
+                                'name': t.get('key', ''),
+                                'description': t.get('goal', ''),
+                                'parameters': {
+                                    'type': 'object',
+                                    'properties': dict_params,
+                                    'required': required_params
+                                }
+                            }
+                        }
+
+                        #print(f'Tool:{tool}')
+                        list_tools.append(tool)
+                        #print(f'List Tools:{list_tools}')
+
+            # Prompt
+            prompt = {
+                    "model": self.AGU.AI_2_MODEL,
+                    "messages": messages,
+                    "tools": list_tools,
+                    "temperature": 0,
+                    "tool_choice": "auto"
+                }
+
+
+            prompt = self.AGU.sanitize(prompt)
+
+            #print(f'RAW PROMPT >> {prompt}')
+            response = self.AGU.llm(prompt)
+
+            if not response:
+                return {
+                    'success': False,
+                    'action': action,
+                    'input': '',
+                    'output': response
+                }
+
+
+            validation = self.AGU.validate_interpret_openai_llm_response(response)
+            if not validation['success']:
+                return {
+                    'success': False,
+                    'action': 'validation',
+                    'input': response,
+                    'output': validation
+                }
+
+            validated_result = validation['output']
+
+
+            # We infer the action_step by analyzing the validated_result.
+            # Some steps in the optimal path have a tool, some don't
+            # The same tool could be used in multiple steps.
+            # We could use the message roll to infer what step are on. But the payroll is kind of saturated with other actions. It could be confusing
+            # We could report every action loop to the state machine. Based on that history, we could compare it with the official optimal path to find the current state
+            # We could use an auxiliary LLM call to ask what action_step are we on, based on all the data available. (but it would be better to do it programmatically)
+
+            continuity = self._get_context().continuity
+            c_id_pre = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}'
+
+            if 'role' in validated_result:
+
+                if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
+                    # This is the LLM asking for a tool to be executed.
+                    selected_tool = validated_result['tool_calls'][0]['function']['name']
+                    _logger_specialist.info("tool call selected=%s", selected_tool)
+
+                    CONSENT_REQUIRED = {'send_email_to_lawyer', 'book_flights_rextur'}
+
+                    if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
+                        # The last message was a response to "3 = WAITING HUMAN".
+                        # The continuity response matches with the selected_tool. Execute tool
+
+                        # We are running the tool
+                        nonce = random.randint(100000, 999999)
+                        tool_step = '4' # 4  = EXECUTION_REQUEST      # tool execution has been requested by agent
+                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{nonce}'
+                        self.AGU.save_chat(validated_result, next = c_id)
+
+                        log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":selected_tool,
+                            "status":tool_step,
+                            "nonce":nonce,
+                            "message":"Consent provided, executing tool",
+                            "type":"consent_ok"
+                        }
+                        self.AGU.mutate_workspace({'action_log': log_entry})
+                
+
+                    elif selected_tool not in CONSENT_REQUIRED:
+                        # No consent needed — execute immediately
+                        nonce = random.randint(100000, 999999)
+                        tool_step = '4' # 4  = EXECUTION_REQUEST
+                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{nonce}'
+                        self.AGU.save_chat(validated_result, next = c_id)
+
+                        log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":selected_tool,
+                            "status":tool_step,
+                            "nonce":nonce,
+                            "message":"Auto-executing tool (no consent required)",
+                            "type":"auto_exec"
+                        }
+                        self.AGU.mutate_workspace({'action_log': log_entry})
+
+                    else:
+
+                        # We are turning the tool call into a message to the user
+
+                        tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
+                        consent = self.consent_form(validated_result)
+                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
+                        self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
+
+                        validated_result = consent['message'] # Replacing original message with consent message.
+
+                        # Recording it in the action_log
+                        log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":selected_tool,
+                            "status":tool_step,
+                            "nonce":consent["nonce"],
+                            "message":consent["message"]["content"],
+                            "type":"consent_rq"
+                        }
+                        self.AGU.mutate_workspace({"action_log": log_entry})
+
+
+
+                elif validated_result.get('role') == 'assistant':
+
+                    if tool_result == 'tool_error':
+                        # This is the interpretation of the error message by the tool
+                        msg = validated_result.get('content')
+
+                        self.AGU.save_chat(validated_result)
+
+                        log_entry = {
+                                "plan_id":continuity["plan_id"],
+                                "plan_step":continuity["plan_step"],
+                                "message":msg
+                        }
+
+                        self.AGU.mutate_workspace({"action_log": log_entry})
+
+
+                    else:
+                    # This is the LLM asking something to the user.
+                        if tool_result == 'fresh_results':
+                            c_id = self._get_context().tool_response_c_id
+                            c_id_parts = c_id.split(':')
+                            nonce = c_id_parts[6]
+                            msg = validated_result.get('content')
+                            #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
+                        else:
+                            _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
+                            nonce = random.randint(100000, 999999)
+                            c_id = f'{c_id_pre}:*:1:{nonce}'
+                            msg = validated_result.get('content')
+
+                            self.AGU.save_chat(validated_result, next=c_id)
+
+                            log_entry = {
+                                    "plan_id":continuity["plan_id"],
+                                    "plan_step":continuity["plan_step"],
+                                    "tool":"*",
+                                    "status":"0",
+                                    "nonce":nonce,
+                                    "message":msg,
+                                    "type":"decision_rq"
+
+                            }
+                            self.AGU.mutate_workspace({"action_log": log_entry})
+
+            return {
+                'success': True,
+                'action': action,
+                'input': '',
+                'output': validated_result
+            }
+
+        except Exception as e:
+            _logger_specialist.error("interpret_failed | %s", e)
+            return {
+                'success': False,
+                'action': action,
+                'input': '',
+                'output': str(e)
+            }
+
+
+
+    ## Execution of Intentions
+    def act(self,command):
+        function = 'act'
+
+        list_tools_raw = self._get_context().list_tools
+
+        list_handlers = {}
+        list_inits = {}
         for t in list_tools_raw:
-            list_handlers[t.get("key", "")] = t.get("handler", "")
-            init_value = t.get("init", {})
+            list_handlers[t.get('key', '')] = t.get('handler', '')
+            init_value = t.get('init', {})
             if isinstance(init_value, str):
                 try:
                     init_value = json.loads(init_value)
                 except (json.JSONDecodeError, ValueError):
                     init_value = {}
-            list_inits[t.get("key", "")] = init_value if isinstance(init_value, dict) else {}
+            list_inits[t.get('key', '')] = init_value if isinstance(init_value, dict) else {}
 
-        tool_name = execution_request["tool_calls"][0]["function"]["name"]
-        params = execution_request["tool_calls"][0]["function"]["arguments"]
-        if isinstance(params, str):
-            params = json.loads(params)
-        tid = execution_request["tool_calls"][0]["id"]
+        self._update_context(list_handlers=list_handlers)
 
-        if not tool_name:
-            raise ValueError("No tool name in tool_calls")
-        hidden = {"_portfolio", "_org", "_entity_type", "_entity_id", "_thread", "_init"}
-        user_params = {k: v for k, v in dict(params).items() if k not in hidden}
-        _logger_spec.info("calling tool=%s params=%s", tool_name, user_params)
-        self.AGU.print_chat(f"Calling tool {tool_name} with parameters {params}", "transient")
-
-        if tool_name not in list_handlers or not list_handlers[tool_name]:
-            raise ValueError(f"No handler for tool '{tool_name}'")
-
-        handler_route = list_handlers[tool_name]
-        parts = handler_route.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid handler route for {tool_name}")
-
-        handler_init = list_inits.get(tool_name, {})
-        if not isinstance(handler_init, dict):
-            handler_init = {}
-
-        params = dict(params)
-        params["_portfolio"] = self.AGU.portfolio
-        params["_org"] = self.AGU.org
-        params["_entity_type"] = self.AGU.entity_type
-        params["_entity_id"] = self.AGU.entity_id
-        params["_thread"] = self.AGU.thread
-        params["_init"] = handler_init
-        if extra and isinstance(extra, dict):
-            params.update(extra)
-
-        step_inputs = extra.get("_step_inputs") if isinstance(extra, dict) else None
-        plan_ctx = extra.get("_plan_context") if isinstance(extra, dict) else None
-
-        if tool_name == "search_flights_rextur":
-            self._force_single_leg_search_payload(params, step_inputs)
-
-        if tool_name == "search_flights_rextur" and isinstance(step_inputs, dict):
-            if step_inputs.get("leg") is not None and "leg" not in params:
-                params["leg"] = step_inputs.get("leg")
-
-        # Force leg from plan step inputs for add_flight_rextur so the return leg is always
-        # stored under the correct key (e.g. "1") even when the model passes leg=0.
-        if tool_name == "add_flight_rextur" and isinstance(step_inputs, dict):
-            si_leg = step_inputs.get("leg")
-            if si_leg is not None:
-                params["leg"] = si_leg
-                _logger_spec.debug("add_flight_rextur leg overridden from step_inputs | leg=%s", si_leg)
-            ob = step_inputs.get("outbound_date") or step_inputs.get("departure_date")
-            if ob and not params.get("outbound_date") and not params.get("departure_date"):
-                params["outbound_date"] = ob
-                params["departure_date"] = ob
-            for ab in (
-                "from_airport_code",
-                "to_airport_code",
-                "passengers",
-                "traveler_ids",
-            ):
-                if step_inputs.get(ab) is not None and params.get(ab) in (None, ""):
-                    params[ab] = step_inputs[ab]
-            if isinstance(plan_ctx, dict):
-                ages = plan_ctx.get("trip_ages") or plan_ctx.get("ages")
-                if ages and not params.get("ages"):
-                    params["ages"] = ages
-
-        for k in (
-            "_step_inputs",
-            "_plan_context",
-            "plan",
-            "intent",
-            "_continuity_plan_id",
-            "_continuity_plan_step",
-        ):
-            params.pop(k, None)
-
-        response = self.AGU.SHC.handler_call(self.AGU.portfolio, self.AGU.org, parts[0], parts[1], params)
-
-        if not response.get("success"):
-            _logger_spec.error(
-                "tool=%s handler_fail | success=False | detail_keys=%s",
-                tool_name,
-                list(response.keys()),
-            )
-            return {"success": False, "action": action, "input": params, "output": response}
-
-        response_meta = {k: v for k, v in response.items() if k not in ("stack", "output")}
-        response_meta["output_size"] = len(str(response.get("output", "")))
-        _logger_spec.info(
-            "tool=%s returned success=True details=%s",
-            tool_name,
-            response_meta,
-        )
-
-        full_output = response.get("output")
-        interface = response.get("interface")
-        if isinstance(full_output, dict) and full_output.get("interface"):
-            interface = interface or full_output.get("interface")
-
-        store_for_llm = (
-            self._trim_tool_output_for_history(tool_name, full_output)
-            if trim_for_chat
-            else full_output
-        )
-        clean_output_str = json.dumps(store_for_llm, cls=DecimalEncoder)
-
-        tool_out = {
-            "role": "tool",
-            "tool_call_id": tid,
-            "content": clean_output_str,
-            "tool_calls": False,
-        }
-
-        next_c_id = None
-        if extra and isinstance(extra, dict):
-            pid = extra.get("_continuity_plan_id")
-            pstep = extra.get("_continuity_plan_step")
-            if pid is not None and str(pstep).strip() != "":
-                nonce = random.randint(100000, 999999)
-                next_c_id = f"irn:c_id:{pid}:{pstep}:{tool_name}:5:{nonce}"
-
-        if interface:
-            self.AGU.save_chat(
-                tool_out,
-                interface=interface,
-                connection_id=self.AGU.connection_id,
-                next=next_c_id,
-            )
-        else:
-            self.AGU.save_chat(
-                tool_out,
-                connection_id=self.AGU.connection_id,
-                next=next_c_id,
-            )
-
-        index = f"irn:tool_rs:{handler_route}"
-        tool_input_obj = json.loads(params) if isinstance(params, str) else params
-        ws_id = getattr(self.AGU, "workspace_id", None)
-        self.AGU.mutate_workspace(
-            {"cache": {index: {"input": tool_input_obj, "output": full_output}}},
-            workspace_id=ws_id,
-        )
-
-        _logger_spec.info("tool=%s done success=True interface=%s", tool_name, interface)
-        djson(
-            "specialist_last_tool_meta.json",
-            {"tool": tool_name, "interface": interface, "handler_route": handler_route},
-        )
-
-        return {
-            "success": True,
-            "action": action,
-            "input": execution_request,
-            "output": tool_out,
-            "_handler_interface": interface,
-        }
-
-    def _verify(self, action_name: str, payload_extra: Dict[str, Any]) -> Dict[str, Any]:
-        action_doc = self._load_action_doc(action_name)
-        verifier_key = (action_doc.get("verification") or "").strip()
-        if not verifier_key:
-            return {"success": True, "output": "no_verifier", "verified": True}
-
-        tools = self._load_all_tools()
-        handler_route = ""
-        for t in tools:
-            if t.get("key") == verifier_key:
-                handler_route = t.get("handler") or ""
-                break
-        if not handler_route or "/" not in handler_route:
-            return {"success": False, "output": f"Verifier {verifier_key} not found"}
-
-        parts = handler_route.split("/")
-        ws = self.AGU.get_active_workspace()
-        plan_id = payload_extra.get("plan_id")
-        plan = ws.get("plan", {}).get(plan_id) if plan_id else None
-        sm = ws.get("state_machine", {}).get(plan_id) if plan_id else None
-
-        vpayload = {
-            "portfolio": self.AGU.portfolio,
-            "org": self.AGU.org,
-            "_entity_type": self.AGU.entity_type,
-            "_entity_id": self.AGU.entity_id,
-            "_thread": self.AGU.thread,
-            "plan_id": plan_id,
-            "plan_step": str(payload_extra.get("plan_step")),
-            "plan": plan,
-            "state_machine": sm,
-        }
-        resp = self.AGU.SHC.handler_call(self.AGU.portfolio, self.AGU.org, parts[0], parts[1], vpayload)
-        return resp
-
-    def _verification_succeeded(self, vres: Dict[str, Any]) -> bool:
-        """True if verifier handler reported success and no failed step in stacked output."""
-        if not vres.get("success"):
-            return False
-        inner = vres.get("output")
-        if isinstance(inner, list):
-            for item in inner:
-                if isinstance(item, dict) and item.get("success") is False:
-                    return False
-        elif isinstance(inner, dict) and inner.get("success") is False:
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    def interpret_iteration(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]],
-        no_tools: bool = False,
-        tool_choice: str = "auto",
-    ):
-        prompt = {
-            "model": self.AGU.AI_2_MODEL,
-            "messages": messages,
-            "temperature": 0,
-            "tool_choice": tool_choice if tools and not no_tools else "auto",
-        }
-        if tools and not no_tools:
-            prompt["tools"] = tools
-            # OpenAI: at most one function call per assistant message (avoids orphan tool_call_ids).
-            prompt["parallel_tool_calls"] = False
-
-        prompt = self.AGU.sanitize(prompt)
-        djson("specialist_last_prompt.json", prompt)
-        response = self.AGU.llm(prompt)
-        if not response:
-            _logger_spec.error("interpret_failed | llm_empty_response")
-            return {"success": False, "output": "LLM failure"}
-        validation = self.AGU.validate_interpret_openai_llm_response(response)
-        if not validation.get("success"):
-            _logger_spec.error("interpret_failed | validation=%s", validation)
-            return {"success": False, "output": validation}
-        return {"success": True, "output": validation["output"]}
-
-    def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute the current intention and return standardized response"""
         try:
-            workspace = self.AGU.get_active_workspace()
-            ws_id = workspace.get("_id")
-            setattr(self.AGU, "workspace_id", ws_id)
-            plan_id = payload.get("plan_id")
-            step_id = str(payload.get("step_id"))
-            action_name = payload.get("action") or ""
-            _logger_spec.info(
-                "specialist started action=%s step_id=%s plan_id=%s",
-                action_name,
-                step_id,
-                plan_id,
-            )
-            step_inputs = payload.get("inputs") or {}
-            title = payload.get("title") or ""
 
-            trip_ctx = {}
-            ages = None
-            trip_doc_flights = None
-            try:
-                parts_eid = (self.AGU.entity_id or "").split("-")
-                trip_id = "-".join(parts_eid[1:]) if len(parts_eid) > 1 else None
-                if trip_id and self.AGU.portfolio and self.AGU.org:
-                    trip_doc = self.AGU.DAC.get_a_b_c(
-                        self.AGU.portfolio, self.AGU.org, "noma_travels", trip_id
-                    )
-                    if isinstance(trip_doc, dict):
-                        ages = trip_doc.get("ages")
-                        trip_ctx["trip_ages"] = ages
-                        trip_ctx["trip_doc_present"] = True
-                        if isinstance(trip_doc.get("flights"), list):
-                            trip_doc_flights = trip_doc["flights"]
-                            trip_ctx["trip_flights"] = trip_doc_flights
-            except Exception:
-                pass
+            tool_name = command['tool_calls'][0]['function']['name']
+            params = command['tool_calls'][0]['function']['arguments']
+            if isinstance(params, str):
+                params = json.loads(params)
+            tid = command['tool_calls'][0]['id']
+            hidden_keys = {'_portfolio', '_org', '_entity_type', '_entity_id', '_thread', '_init', 'plan_id', 'plan_step', 'action_step', 'tool_step', 'continuity', 'workspace', 'state_machine'}
+            user_params = {k: v for k, v in params.items() if k not in hidden_keys}
+            _logger_specialist.info("calling tool=%s params=%s", tool_name, user_params)
 
-            pend = self._get_pending_from_workspace(workspace)
-            if (
-                pend
-                and str(pend.get("plan_id")) == str(plan_id)
-                and str(pend.get("plan_step")) == step_id
-            ):
-                assistant_cmd = pend.get("assistant_command")
-                if assistant_cmd:
-                    tools_raw = self._load_all_tools()
-                    extra = {
-                        "_step_inputs": step_inputs,
-                        "_plan_context": trip_ctx,
-                        "plan": workspace.get("plan", {}).get(plan_id),
-                        "intent": workspace.get("intent"),
-                        "_continuity_plan_id": plan_id,
-                        "_continuity_plan_step": step_id,
-                    }
-                    act_res = self._act(assistant_cmd, tools_raw, extra=extra)
-                    self._set_pending_tool(None, ws_id)
-                    if not act_res.get("success"):
-                        return {
-                            "success": False,
-                            "output": {"status": "error", "detail": act_res},
-                        }
-                    vres = self._verify(
-                        action_name,
-                        {"plan_id": plan_id, "plan_step": step_id},
-                    )
-                    if not vres.get("success"):
-                        return {
-                            "success": False,
-                            "output": {"status": "error", "detail": vres},
-                        }
-                    if self._verification_succeeded(vres):
-                        return {"success": True, "output": {"status": "completed"}}
-                    return {"success": False, "output": {"status": "error", "detail": vres}}
 
-            action_doc = self._load_action_doc(action_name)
-            approved_keys = self._approved_tool_keys(action_doc)
-            list_tools_raw = self._load_all_tools()
-            openai_tools = self._build_openai_tools(list_tools_raw, approved_keys)
+            if not tool_name:
+                raise ValueError("❌ No tool name provided in tool selection")
 
-            try:
-                mh = self.AGU.get_message_history(include_internal=True)
-            except TypeError:
-                # Older AgentUtilities without include_internal flag
-                mh = self.AGU.get_message_history()
-            message_list = mh.get("output") or []
-            message_list = self.AGU.strip_orphan_tool_messages(message_list)
-            message_list = self.AGU.ensure_tool_responses_after_assistant(message_list)
-            message_list = self.AGU.clear_tool_message_content(message_list, recent_tool_messages=1)
+            print(f"Selected tool: {tool_name}")
+            self.AGU.print_chat(f'Calling tool {tool_name} with parameters {params} ', 'transient')
 
-            search_leg_note = (
-                "Flight search (search_flights_rextur): this step quotes **one leg only**. "
-                "Pass `legs` as a **single** segment matching the step inputs below. "
-                "Do **not** bundle outbound+return into one search — the next plan step runs the other leg. "
-                "**At most one tool call per assistant message** — never emit two search_flights_rextur (or any two tools) "
-                "in the same turn; run one tool, read the tool result, then continue in the next turn if needed. "
-                "Use **show_options** / **ask_user** (see tools_reference) so the secretary can choose "
-                "before **add_flight_rextur**."
-            )
-            react_trace_note = (
-                "REACT SCRATCHPAD REQUIRED:\n"
-                "- Before each tool call, first send a short assistant message (1–2 lines, no tool_calls) "
-                "stating what you intend to do and why. The runtime stores this as internal reasoning and "
-                "replays it back to you on the next turn — prefixed with `[reasoning]`.\n"
-                "- After each tool result, send another short assistant message evaluating whether the result "
-                "looks sensible (e.g. cheapest matches expected range; airlines/time match the ask). If it "
-                "looks wrong, plan a retry with relaxed/adjusted parameters before exposing anything to the user.\n"
-                "- If the runtime injects a message beginning with `WARNING:` into a tool result, treat it as "
-                "evidence that the tool output is suspect — reason about it and re-call the tool with better "
-                "arguments rather than passing the suspect data to show_options/add_flight.\n"
-                "- Never respond with empty content or placeholders like `🤖🤖`. Always either call a tool or "
-                "emit real reasoning / a user-facing message."
-            )
-            instruction_parts = [
-                self._meta_language_directive(),
-                action_doc.get("prompt_3_reasoning_and_planning") or "",
-                action_doc.get("goal") or "",
-                search_leg_note,
-                react_trace_note,
-                f"Step title (goal): {title}",
-                f"Structured step inputs (belief): {json.dumps(step_inputs, ensure_ascii=False)}",
-                "Use tools to progress. Do not paste large flight tables in assistant text; rely on tools.",
-                "For user-visible questions use ask_user / show_options tools when appropriate.",
-            ]
-            if action_name == "post_execution":
-                instruction_parts.append(
-                    "POST_EXECUTION GATE: Each model turn must include a tool call until this step completes. "
-                    "Verification reads the trip DB (lawyer email sent or booking confirmed). "
-                    "Plain assistant text does not satisfy verification. "
-                    "Use ask_user for user-visible Q&A; use send_email_to_lawyer (with `to`) to actually email."
-                )
-                instruction_parts.append(
-                    "send_email_to_lawyer: keep `intro_text` to a short greeting + trip/dates summary only — "
-                    "do not enumerate flights in prose (the HTML email already renders option cards per leg). "
-                    "Optional `closing_text` for a brief sign-off after the cards."
-                )
-            if action_name == "post_execution" and trip_doc_flights:
-                # Count segments per leg across all flight entries
-                legs_shortlist_counts: Dict[str, int] = {}
-                for fe in trip_doc_flights:
-                    if not isinstance(fe, dict):
-                        continue
-                    for leg_k, segs in (fe.get("legs_shortlist") or {}).items():
-                        cnt = len(segs) if isinstance(segs, list) else (1 if segs else 0)
-                        legs_shortlist_counts[str(leg_k)] = legs_shortlist_counts.get(str(leg_k), 0) + cnt
-                has_multiple = any(v > 1 for v in legs_shortlist_counts.values())
-                send_rule = (
-                    "DECISION RULE: there are multiple flight options per leg (legs_shortlist counts: "
-                    f"{legs_shortlist_counts}). Use send_email_to_lawyer — do NOT book."
-                ) if has_multiple else (
-                    "DECISION RULE: exactly one option per leg detected. "
-                    "You MAY book directly (book_flights_rextur) if the secretary explicitly confirms, "
-                    "but send_email_to_lawyer remains the safe default."
-                )
-                instruction_parts.append(
-                    "TRIP FLIGHTS DATA (from trip document):\n"
-                    + json.dumps(trip_doc_flights, ensure_ascii=False, cls=DecimalEncoder)
-                    + f"\n\n{send_rule}"
-                )
-            messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": "\n\n".join(instruction_parts)},
-            ]
-            for msg in message_list:
-                messages.append(msg)
+            # Check if handler exists
+            if tool_name not in list_handlers:
+                error_msg = f"❌ No handler found for tool '{tool_name}'"
+                _logger_specialist.error("handler_not_found | tool=%s", tool_name)
+                self.AGU.print_chat(error_msg, 'error')
+                raise ValueError(error_msg)
 
-            max_iterations = (
-                MAX_REACT_ITERATIONS_POST_EXECUTION
-                if action_name == "post_execution"
-                else MAX_REACT_ITERATIONS
-            )
-            iteration = 0
-            post_exec_no_tool_streak = 0
-            post_exec_verify_nudge_sent = False
+            # Check if handler is an empty string
+            if list_handlers[tool_name] == '':
+                error_msg = f"❌ Handler is empty"
+                _logger_specialist.error("handler_empty | tool=%s", tool_name)
+                self.AGU.print_chat(error_msg, 'error')
+                raise ValueError(error_msg)
 
-            while iteration < max_iterations:
-                iteration += 1
-                _logger_spec.debug(
-                    "specialist loop iteration=%s/%s",
-                    iteration,
-                    max_iterations,
-                )
-                # Before each LLM turn: if this action has a verifier and the trip already
-                # satisfies it (e.g. quote segment present), exit — skip further tools/chat.
-                # Skip when verification is unset: _verify would otherwise no-op success.
-                if (action_doc.get("verification") or "").strip():
-                    early_v = self._verify(
-                        action_name,
-                        {"plan_id": plan_id, "plan_step": step_id},
-                    )
-                    if self._verification_succeeded(early_v):
-                        _logger_verify.info(
-                            "verify_result | phase=before_turn | result=SUCCESS | stop_loop=True"
-                        )
-                        return {"success": True, "output": {"status": "completed"}}
+            # Check if init exists and is valid
+            handler_init = {}
+            if not isinstance(list_inits[tool_name], str) and isinstance(list_inits[tool_name], dict):
+                handler_init = list_inits[tool_name]
 
-                tool_choice = "auto"
-                if (
-                    action_name == "post_execution"
-                    and openai_tools
-                    and post_exec_no_tool_streak >= 2
-                    and (action_doc.get("verification") or "").strip()
-                ):
-                    tool_choice = "required"
-                    _logger_spec.warning(
-                        "post_execution forcing tool_choice=required | no_tool_streak=%s",
-                        post_exec_no_tool_streak,
-                    )
 
-                interp = self.interpret_iteration(
-                    messages,
-                    openai_tools,
-                    no_tools=False,
-                    tool_choice=tool_choice,
-                )
-                if not interp["success"]:
-                    return {
-                        "success": False,
-                        "output": {"status": "error", "detail": interp},
-                    }
+            # Check if handler has the right format (2 parts: tool/handler, or 3 parts: tool/handler/subhandler)
+            handler_route = list_handlers[tool_name]
+            parts = handler_route.split('/')
+            if len(parts) < 2 or len(parts) > 3:
+                error_msg = f"❌ {tool_name} is not a valid tool. Handler route must be 'tool/handler' or 'tool/handler/subhandler'."
+                _logger_specialist.error("invalid_handler_route | tool=%s | route=%s", tool_name, handler_route if 'handler_route' in dir() else '')
+                self.AGU.print_chat(error_msg, 'error')
+                raise ValueError(error_msg)
 
-                assistant_msg = interp["output"]
+            # For 3-part routes (tool/handler/subhandler), combine handler and subhandler
+            tool = parts[0]
+            handler = '/'.join(parts[1:])  # "handler" or "handler/subhandler"
 
-                if assistant_msg.get("tool_calls"):
-                    post_exec_no_tool_streak = 0
-                    raw_tcs = assistant_msg["tool_calls"]
-                    if len(raw_tcs) > 1:
-                        _logger_spec.warning(
-                            "multiple tool_calls in one turn (%s); executing first only",
-                            len(raw_tcs),
-                        )
-                    tc = raw_tcs[0]
-                    tool_name = tc["function"]["name"]
-                    _logger_spec.info("tool call selected=%s", tool_name)
+            portfolio = self._get_context().portfolio
+            org = self._get_context().org
 
-                    # Persist only the tool call we execute — avoids orphan tool_call_ids vs one tool row.
-                    cmd = {
-                        "role": "assistant",
-                        "tool_calls": [tc],
-                        "content": assistant_msg.get("content") or "",
-                    }
-                    self.AGU.save_chat(cmd, connection_id=self.AGU.connection_id)
+            params['_portfolio'] = self._get_context().portfolio
+            params['_org'] = self._get_context().org
+            params['_entity_type'] = self._get_context().entity_type
+            params['_entity_id'] = self._get_context().entity_id
+            params['_thread'] = self._get_context().thread
+            params['_init'] = handler_init
 
-                    raw_args = tc["function"].get("arguments") or "{}"
-                    args_obj = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            _logger_specialist.debug("calling handler route=%s", handler_route)
 
-                    if tool_name in CONSENT_REQUIRED_TOOLS:
-                        nonce = random.randint(10000, 99999)
-                        consent_body = self._consent_message_body(tool_name, args_obj)
-                        self.AGU.save_chat(
-                            consent_body,
-                            interface="binary_consent",
-                            msg_type="consent",
-                            connection_id=self.AGU.connection_id,
-                        )
-                        self._set_pending_tool(
-                            {
-                                "plan_id": plan_id,
-                                "plan_step": step_id,
-                                "assistant_command": cmd,
-                                "nonce": nonce,
-                                "tool_name": tool_name,
-                            },
-                            ws_id,
-                        )
-                        self.AGU.mutate_workspace(
-                            {
-                                "action_log": {
-                                    "plan_id": plan_id,
-                                    "plan_step": step_id,
-                                    "tool": tool_name,
-                                    "status": "3",
-                                    "nonce": nonce,
-                                    "message": consent_body.get("content", ""),
-                                    "type": "consent_rq",
-                                }
-                            }
-                        )
-                        return {"success": True, "output": {"status": "awaiting"}}
+            response = self.SHC.handler_call(portfolio, org, tool, handler, params)
 
-                    extra = {
-                        "_step_inputs": step_inputs,
-                        "_plan_context": trip_ctx,
-                        "plan": workspace.get("plan", {}).get(plan_id),
-                        "intent": workspace.get("intent"),
-                        "_continuity_plan_id": plan_id,
-                        "_continuity_plan_step": step_id,
-                    }
-                    act_res = self._act(cmd, list_tools_raw, extra=extra)
-                    if not act_res.get("success"):
-                        return {
-                            "success": False,
-                            "output": {"status": "error", "detail": act_res},
-                        }
+            #response = {'success':True,'output':{"some":"mockup response"}}
 
-                    tool_payload = act_res.get("output") or {}
-                    iface = act_res.get("_handler_interface")
-                    try:
-                        content_obj = json.loads(tool_payload.get("content", "{}"))
-                        if isinstance(content_obj, dict):
-                            iface = iface or content_obj.get("interface")
-                            outn = content_obj.get("output")
-                            if isinstance(outn, dict) and outn.get("interface"):
-                                iface = iface or outn.get("interface")
-                    except (json.JSONDecodeError, TypeError):
-                        content_obj = {}
+            response_clean = {k: v for k, v in response.items() if k not in ['stack', 'output']}
+            response_clean['output_size'] = len(str(response.get('output', '')))
+            _logger_specialist.info("tool=%s returned success=%s details=%s", tool_name, response.get('success'), response_clean)
 
-                    # Detect pause flag — tools can opt out to let the model chain another call.
-                    pause_flag = True
-                    if isinstance(content_obj, dict):
-                        inner_out = content_obj.get("output") if isinstance(content_obj.get("output"), dict) else None
-                        if isinstance(inner_out, dict) and "pause" in inner_out:
-                            pause_flag = bool(inner_out.get("pause"))
-                        elif "pause" in content_obj:
-                            pause_flag = bool(content_obj.get("pause"))
+            #raise Exception('Troubleshooting stop')
 
-                    # show_options uses interface=flights_rextur for the carousel UI; still pause for tap/reply
-                    # unless the tool explicitly emitted pause=false.
-                    if tool_name == "show_options" and pause_flag:
-                        _logger_spec.info(
-                            "specialist pause | tool=show_options interface=%s -> awaiting user",
-                            iface,
-                        )
-                        return {"success": True, "output": {"status": "awaiting"}}
+            if not response['success']:
+                # The handler came back with an error. The output contains the handler's execution list
+                raise Exception (response['output'])
 
-                    awaiting_iface = {"awaiting", "options", "awaiting_lawyer_reply"}
-                    if iface in awaiting_iface and pause_flag:
-                        if tool_name == "ask_user":
-                            inner_out = content_obj.get("output") if isinstance(content_obj, dict) else None
-                            question_text = (
-                                (isinstance(inner_out, dict) and inner_out.get("message"))
-                                or (isinstance(content_obj, dict) and content_obj.get("message"))
-                                or ""
-                            )
-                            if question_text:
-                                self.AGU.save_chat(
-                                    {"role": "assistant", "content": str(question_text)},
-                                    connection_id=self.AGU.connection_id,
-                                )
-                        return {"success": True, "output": {"status": "awaiting"}}
+            # The response of every handler always comes in 'output'
+            clean_output = sanitize(response['output'])
+            clean_output_str = json.dumps(clean_output)
 
-                    # After send_email_to_lawyer succeeds, save email_preview canvas message
-                    if tool_name == "send_email_to_lawyer" and act_res.get("success"):
-                        try:
-                            raw_out = content_obj.get("output") if isinstance(content_obj, dict) else {}
-                            if not isinstance(raw_out, dict):
-                                raw_out = {}
-                            html_body = raw_out.get("html_body") or ""
-                            if html_body:
-                                self.AGU.save_chat(
-                                    {
-                                        "role": "tool",
-                                        "_interface": "email_preview",
-                                        "content": json.dumps({"html_body": html_body}),
-                                    },
-                                    connection_id=self.AGU.connection_id,
-                                )
-                        except Exception:
-                            pass
+            interface = None
+            # The handler determines the interface
+            if 'interface' in response:
+                interface = response['interface']
 
-                    tool_content = tool_payload.get("content", "")
-                    messages.append(cmd)
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": tool_content}
-                    )
-
-                    vres = self._verify(
-                        action_name,
-                        {"plan_id": plan_id, "plan_step": step_id},
-                    )
-                    if self._verification_succeeded(vres):
-                        return {"success": True, "output": {"status": "completed"}}
-                    continue
-
-                # No tool calls: internal reasoning unless user-facing allowed
-                post_exec_no_tool_streak += 1
-                content = assistant_msg.get("content") or ""
-                internal_msg = {
-                    "role": "assistant",
-                    "content": content,
+            tool_out = {
+                    "role": "tool",
+                    "tool_call_id": f'{tid}',
+                    "content": clean_output_str,
+                    "tool_calls":False
                 }
-                self.AGU.save_chat(internal_msg, msg_type="internal", connection_id=self.AGU.connection_id)
 
-                if (
-                    action_name == "post_execution"
-                    and (action_doc.get("verification") or "").strip()
-                    and not post_exec_verify_nudge_sent
-                ):
-                    v_tail = self._verify(
-                        action_name,
-                        {"plan_id": plan_id, "plan_step": step_id},
-                    )
-                    if not self._verification_succeeded(v_tail):
-                        messages.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "VERIFICAÇÃO: a viagem ainda não tem e-mail ao advogado registrado como enviado "
-                                    "nem reserva confirmada. Você precisa chamar uma ferramenta nesta rodada "
-                                    "(send_email_to_lawyer com `to`, ask_user, show_options ou book_flights_rextur). "
-                                    "Mensagem em texto só não atualiza o sistema — não diga que o e-mail foi enviado sem o tool."
-                                ),
-                            }
-                        )
-                        post_exec_verify_nudge_sent = True
+            # Custom assembling the c_id to become the consent_form for the next step which is for the user to take action on the tool results.
+            # The asterisk (*) means any tool that is going to process the response to this results.
+            continuity = self._get_context().continuity
+            nonce = random.randint(100000, 999999)
+            c_id = f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:{tool_name}:5:{nonce}'
 
-                if iteration >= max_iterations - 1:
-                    user_visible = {
-                        "role": "assistant",
-                        "content": content
-                        or "Não consegui concluir esta etapa automaticamente; envie mais detalhes.",
-                    }
-                    self.AGU.save_chat(user_visible, connection_id=self.AGU.connection_id)
-                    return {"success": True, "output": {"status": "awaiting"}}
+            # Save the message after it's created
+            # Important: Because we had to create a response message in advance, we are upserting an existing message, not creating a new one.
+            #  The upsert only takes 'content', '_interface' and '_next' changes.
 
-                messages.append(internal_msg)
+            self.AGU.save_chat(tool_out,interface=interface, next=c_id)
 
-            return {"success": True, "output": {"status": "awaiting"}}
+
+            # Results coming from the handler
+            self._update_context(tool_response_c_id=c_id)
+
+
+            # Save handler result to workspace
+
+            # Turn an object like this one: {"people":"4","time":"16:00","date":"2025-06-04"}
+            # Into a string like this one: "4/16:00/2026-06-04"
+            # If the value of each key is not a string just output an empty space in its place
+            #params_str = self.format_object_to_slash_string(params)
+            index = f'irn:tool_rs:{handler_route}'
+            tool_input = command['tool_calls'][0]['function']['arguments']
+            #input is a serialize json, you need to turn it into a python object before inserting it into the value dictionary
+            tool_input_obj = json.loads(tool_input) if isinstance(tool_input, str) else tool_input
+            value = {'input': tool_input_obj, 'output': clean_output}
+
+
+            #Reporting to the State Machine
+            log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":tool_name, # The tool that will process this response
+                            "status":"5", # This 3 refers to the
+                            "nonce":nonce,
+                            "message":"Tool executed.",
+                            "type":"tool_ok"
+                        }
+
+
+            self.AGU.mutate_workspace(
+                {
+                    'cache': {index:value},
+                    'action_log': log_entry
+                },
+                workspace_id=self._get_context().workspace_id
+            )
+
+
+            #print(f'message output: {tool_out}')
+            _logger_specialist.info("tool=%s done success=True", tool_name)
+
+
+            return {"success": True, "function": function, "input": command, "output": tool_out}
 
         except Exception as e:
-            _logger_spec.exception("specialist_run_failed | %s", e)
-            self.AGU.print_chat(f"Specialist error: {e}", "error")
-            return {"success": False, "output": {"status": "error", "message": str(e)}}
+
+            # Notice that this exception won't leave a trace in the messages.
+            # Interpret uses messages to read the output of act().
+            # We are passing the error results via the context instead
+
+            error_msg = f"❌ Tool failed. Trying something different. @act trying to run tool:'{tool_name}': {str(e)}"
+            self.AGU.print_chat(error_msg,'error')
+            self._update_context(execute_intention_error=error_msg)
+
+            continuity = self._get_context().continuity
+            log_entry = {
+                'plan_id':continuity['plan_id'],
+                'plan_step':continuity['plan_step'],
+                'message': f'Tool failed:{e}'
+            }
+            self.AGU.mutate_workspace({'action_log': log_entry})
+
+            error_result = {
+                "success": False, "action": function,"input": command,"output": str(e)
+            }
+
+            return error_result
+
+    def check(self,command):
+        function = 'check'
+        tool_name = None  # Initialize to avoid UnboundLocalError
+
+        try:
+
+            list_tools_raw = self._get_context().list_tools
+
+            list_handlers = {}
+            for t in list_tools_raw:
+                list_handlers[t.get('key', '')] = t.get('handler', '')
+
+            tool_name = command['tool_calls'][0]['function']['name']
+            params = command['tool_calls'][0]['function']['arguments']
+
+            handler_route = list_handlers[tool_name]
+            parts = handler_route.split('/')
+
+            if len(parts) != 2:
+                error_msg = f"❌ {tool_name} is not a valid tool."
+                _logger_specialist.error("invalid_tool_route | tool=%s", tool_name)
+                self.AGU.print_chat(error_msg, 'error')
+                raise ValueError(error_msg)
+
+            portfolio = self._get_context().portfolio
+            org = self._get_context().org
+
+            params['_portfolio'] = self._get_context().portfolio
+            params['_org'] = self._get_context().org
+            params['_entity_type'] = self._get_context().entity_type
+            params['_entity_id'] = self._get_context().entity_id
+            params['_thread'] = self._get_context().thread
+
+
+            response = self.SHC.handler_check(portfolio,org,parts[0],parts[1],params)
+
+            return {"success": True, "action": function, "input": "", "output": response}
+
+
+        except Exception as e:
+
+            tool_name_str = tool_name if tool_name else 'unknown'
+            error_msg = f"❌ Check failed. @check :'{tool_name_str}': {str(e)}"
+            self.AGU.print_chat(error_msg,'error')
+            print(error_msg)
+            self._update_context(execute_intention_error=error_msg)
+
+            continuity = self._get_context().continuity
+
+            error_result = {
+                "success": False, "action": function,"input": command,"output": str(e)
+            }
+
+            log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":tool_name_str,
+                            "nonce":random.randint(100000, 999999),
+                            "message":"Check failed"
+                        }
+            self.AGU.mutate_workspace({'action_log': log_entry})
+
+            return error_result
+
+
+    def verify(self,action):
+        function = 'verify'
+        verification_handler = None  # Initialize to avoid UnboundLocalError
+        params = {}  # Initialize params dictionary
+
+        try:
+
+            for a in self._get_context().list_actions:
+                if a['key'] == self._get_context().current_action:
+                    if 'verification' not in a:
+                        raise Exception (f'No verification handler found for this action: {a.get("key", "N/A")}')
+
+                    verification_tool = a['verification']
+
+            for t in self._get_context().list_tools:
+                if t['key'] == verification_tool:
+                    verification_handler = t.get('handler', '')
+
+            parts = verification_handler.split('/')
+
+            if len(parts) != 2:
+                error_msg = f"❌ {verification_handler} is not a valid verification tool."
+                _logger_verify.error("invalid_verification_route | handler=%s", verification_handler)
+                self.AGU.print_chat(error_msg, 'error')
+                raise ValueError(error_msg)
+
+            portfolio = self._get_context().portfolio
+            org = self._get_context().org
+
+            params['_portfolio'] = self._get_context().portfolio
+            params['_org'] = self._get_context().org
+            params['_entity_type'] = self._get_context().entity_type
+            params['_entity_id'] = self._get_context().entity_id
+            params['_thread'] = self._get_context().thread
+
+            continuity = self._get_context().continuity
+            params['plan_id'] = continuity["plan_id"]
+            params['plan_step'] = continuity["plan_step"]
+
+            # Plan and State Machine
+            workspace = self.AGU.get_active_workspace()
+            params['plan'] = workspace['plan'][continuity['plan_id']]
+            params['state_machine'] = workspace['state_machine'][continuity['plan_id']]
+
+            response = self.SHC.handler_call(portfolio,org,parts[0],parts[1],params)
+            _logger_verify.info("verify_called | action=%s | handler=%s", action, verification_handler)
+
+            if response['success']:
+                msg = f"Verification OK. Step Completed."
+                tool_step = '5'
+                continuity = self._get_context().continuity
+                log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "status":tool_step,
+                            "message":msg
+                }
+                self.AGU.mutate_workspace({'action_log': log_entry})
+
+                self.AGU.print_chat(msg,'transient')
+                _logger_verify.info("verify_result | result=SUCCESS | stop_loop=True")
+
+            else:
+                output = response.get('output')
+                if isinstance(output, dict):
+                    actionable = output.get('actionable')
+                elif isinstance(output, list):
+                    actionable = None
+                    for item in output:
+                        if isinstance(item, dict) and item.get('actionable'):
+                            actionable = item.get('actionable')
+                            break
+                else:
+                    actionable = None
+
+                msg = f"Step has not been completed yet. Continue the loop"
+                continuity = self._get_context().continuity
+                log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "message":msg,
+                            "actionable":actionable
+                }
+                self.AGU.mutate_workspace({'action_log': log_entry})
+                _logger_verify.info("verify_result | result=FAILED | stop_loop=False")
+
+            return {"success": response['success'], "action": function, "input": "", "output": response['output']}
+
+
+        except Exception as e:
+
+            verification_handler_str = verification_handler if verification_handler else 'unknown'
+            error_msg = f"❌ Verification failed. @verify :'{verification_handler_str}': {str(e)}"
+            self.AGU.print_chat(error_msg,'error')
+            print(error_msg)
+            self._update_context(execute_intention_error=error_msg)
+
+            continuity = self._get_context().continuity
+
+            error_result = {
+                "success": False, "action": function,"input": action,"output": str(e)
+            }
+
+            log_entry = {
+                            "plan_id":continuity["plan_id"],
+                            "plan_step":continuity["plan_step"],
+                            "tool":verification_handler_str,
+                            "status":"6",
+                            "nonce":random.randint(100000, 999999),
+                            "message":f'Verification failed: {e}'
+                        }
+            self.AGU.mutate_workspace({'action_log': log_entry})
+
+            return error_result
+
+
+    @staticmethod
+    def _now() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+    def run(self, payload):
+
+        '''
+        The payload contains the plan step
+
+        EXAMPLE STEP
+        {
+            "action": "quote_flight",
+            "depends_on": [],
+            "enter_guard": "True",
+            "inputs": {
+                "from_airport_code": "MIA",
+                "outbound_date": "2025-12-14",
+                "passengers": "3",
+                "to_airport_code": "LAS"
+            },
+            "next_step": "1",
+            "step_id": "0",
+            "success_criteria": "len(result) > 0",
+            "title": "Miami to Las Vegas outbound flight"
+            "continuity":{
+                "plan_id":"",
+                "plan_step":"",
+                "action_step":"",
+                "tool_step":""
+            } #Added in the executor
+
+        }
+        '''
+
+        '''
+        tool_step (status code)
+        0  = DEFAULT                # Default, tool has not being started
+        1  = REQUEST_INFO           # Agent requesting information from human
+        2  = WAITING_TOOL_IO        # waiting for external tool response / callback
+        3  = WAITING_HUMAN          # waiting for human confirmation / input
+        4  = EXECUTION_REQUEST      # tool execution has been requested by agent
+        5  = COMPLETED_OK           # tool finished
+        6  = COMPLETED_ERROR        # tool failed / exception / unrecoverable
+        7  = CANCELLED              # step aborted (by user/system)
+        '''
+
+        action = 'run > specialist'
+        _logger_specialist.info("specialist started action=%s step_id=%s", payload.get('action'), payload.get('step_id'))
+
+
+        # Get context from AGU if available, otherwise create new
+
+        try:
+
+            context = RequestContext()
+
+            # Populate context from AGU
+            if hasattr(self.AGU, 'portfolio'):
+                context.portfolio = self.AGU.portfolio
+                context.org = self.AGU.org
+                context.entity_type = self.AGU.entity_type
+                context.entity_id = self.AGU.entity_id
+                context.thread = self.AGU.thread
+
+            # Get available actions and tools
+            actions = self.DAC.get_a_b(context.portfolio, context.org, 'schd_actions')
+            context.list_actions = actions['items']
+
+            tools = self.DAC.get_a_b(context.portfolio, context.org, 'schd_tools')
+            context.list_tools = tools['items']
+
+
+            # Step information
+            context.inputs = payload.get('inputs',{})
+            context.title = payload.get('title','')
+
+            context.step_id = payload.get('step_id','')
+            context.current_action = payload.get('action', '')
+            context.continuity = payload.get('continuity',{}) # plan_id, plan_step, action_step, tool_id
+
+
+            # Set the initial context for this turn
+            self._set_context(context)
+
+            results = []
+
+            #A. Extract the action from the step object.
+            if not context.current_action:
+                return {'success': False, 'action': action, 'input': payload, 'output': 'No action specified in step'}
+            # Save Action document. The specialist will follow it.
+            self.AGU.mutate_workspace({'action': context.current_action})
+
+            # Run the ReAct loop
+
+            loops = 0
+            loop_limit = 6
+            tool_result = ''
+            verification_result = ''
+            while loops < loop_limit:
+                loops = loops + 1
+                _logger_specialist.debug("loop %d/%d", loops, loop_limit)
+
+
+                # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
+                response_1 = self.interpret(tool_result=tool_result)
+                tool_result = ''
+
+
+                results.append(response_1)
+                if not response_1['success']:
+                    # Something went wrong during message interpretation
+                    print('Something went wrong during interpret(). Exiting specialist')
+                    return {'success':False,'action':action,'output':response_1,'stack':results}
+
+
+                if verification_result:
+                    output = {
+                        'status':'completed'
+                    }
+                    return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
+
+
+                # Check whether we need to run a tool
+
+                if 'tool_calls' in response_1['output'] and response_1['output']['tool_calls']:
+                    # Tool need Execution
+                    # Step 2: Act. Agent runs the tool
+
+                    response_2 = self.act(response_1['output'])
+                    results.append(response_2)
+                    tool_result = 'fresh_results'
+
+
+                    if not response_2['success']:
+                        #print('Tool failed, feeding tool output to loop. Agent will try to fix it. Otherwise will exit.')
+                        # Something went wrong during tool execution, Have the agent try to fix it instead of just giving up.
+                        #return {'success':False,'action':action,'output':response_2,'stack':results}
+                        tool_result = 'tool_error'
+
+                        #continue
+
+                    '''
+                    # Tool returned successfully. Run tool custom checks
+                    response_2b = self.check(response_2['output'])
+                    results.append(response_2b)
+                    if not response_2b['success']:
+                        tool_result = 'tool_error'
+                    '''
+
+
+                    # Run verification script to figure out if action is done
+                    response_2c= self.verify(context.current_action)
+                    results.append(response_2c)
+                    if response_2c['success']:
+                        # Action is done, exit the specialist
+                        verification_result = 'action_done'
+                        # Instead or returning here, we'll let the agent interpret the tool results first
+                        # but we won't give the agent the opportunity to call another tool.
+
+                        log_entry = {
+                            'plan_id':context.continuity['plan_id'],
+                            'plan_step':context.continuity['plan_step'],
+                            'message':'Step completed'
+                        }
+
+                        self.AGU.mutate_workspace({'action_log': log_entry})
+                        print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | verification=completed")
+
+                elif 'tool_calls' not in response_1['output'] or not response_1['output']['tool_calls']:
+                    # No Tool needs execution.
+                    # Most likely the agent is asking for more information to fill tool parameters.
+                    # Or agent is answering questions directly from the belief system.
+
+                    self.AGU.print_chat(f'🤖','transient')
+
+                    # The above code is creating a Python dictionary named `output` with a single
+                    # key-value pair. The key is 'status' and the value is 'awaiting'.
+
+                    output = {
+                        'status':'awaiting'
+                    }
+                    print(f"[SPECIALIST] loop_end {loops}/{loop_limit} | status=awaiting")
+
+                    return {'success':True,'action':action,'input':payload, 'output':output ,'stack':results}
+
+
+            #Gracious exit. Analyze the last tool run (act()) but you can't issue a new tool_call.
+            response_3 = self.interpret(no_tools=True)
+            results.append(response_3)
+            if not response_3['success']:
+                    # Something went wrong during message interpretation
+                    return {'success':False,'action':action,'output':response_3,'stack':results}
+
+
+            # If we reach here, we hit the loop limit
+            print(f'Warning: Reached maximum loop limit ({loop_limit})')
+            self.AGU.print_chat(f'🤖⚠️  Can you re-formulate your request please?','text')
+            return {'success':True,'action':action,'input':payload,'output':response_3['output'],'stack':results}
+
+
+        except Exception as e:
+            self.AGU.print_chat(f'🤖❌(Specialist):{e}','transient')
+            return {'success':False,'action':action,'output':f'Run failed. Error:{str(e)}','stack':results}
