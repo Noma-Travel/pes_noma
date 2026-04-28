@@ -201,6 +201,23 @@ class Specialist:
             params=params,
         ) or f"I would like to call {tool_name} tool with the following parameters: {params}. Please confirm it is ok."
 
+        preview_html = None
+        if tool_name == 'send_email_to_lawyer':
+            try:
+                from noma.handlers.send_email_to_lawyer import preview_email_html
+                ctx = self._get_context()
+                preview_args = {
+                    **arguments_dict,
+                    '_portfolio': ctx.portfolio,
+                    '_org': ctx.org,
+                    '_entity_type': ctx.entity_type,
+                    '_entity_id': ctx.entity_id,
+                    '_thread': ctx.thread,
+                }
+                preview_html = preview_email_html(preview_args)
+            except Exception as e:
+                _logger_specialist.warning("consent_form preview_html failed | %s", e)
+
         consent = {
             'commands':payload['tool_calls'],
             'interface':'binary_consent',
@@ -513,7 +530,10 @@ class Specialist:
                         tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
                         consent = self.consent_form(validated_result)
                         c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
-                        self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
+                        consent_message = dict(consent['message'])
+                        if consent.get('preview_html'):
+                            consent_message['preview_html'] = consent['preview_html']
+                        self.AGU.save_chat(consent_message, msg_type='consent', next = c_id)
 
                         validated_result = consent['message'] # Replacing original message with consent message.
 
