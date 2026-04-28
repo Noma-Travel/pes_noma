@@ -222,6 +222,7 @@ class Specialist:
             'commands':payload['tool_calls'],
             'interface':'binary_consent',
             'nonce': random.randint(100000, 999999),
+            'preview_html': preview_html,
             'message':{
                 "role": "assistant",
                 "content": consent_msg
@@ -571,11 +572,22 @@ class Specialist:
                     else:
                     # This is the LLM asking something to the user.
                         if tool_result == 'fresh_results':
-                            c_id = self._get_context().tool_response_c_id
-                            c_id_parts = c_id.split(':')
-                            nonce = c_id_parts[6]
+                            nonce = random.randint(100000, 999999)
+                            c_id = f'{c_id_pre}:*:1:{nonce}'
                             msg = validated_result.get('content')
-                            #f'irn:c_id:{continuity["plan_id"]}:{continuity["plan_step"]}:*:3:{nonce}'
+
+                            self.AGU.save_chat(validated_result, next=c_id)
+
+                            log_entry = {
+                                    "plan_id":continuity["plan_id"],
+                                    "plan_step":continuity["plan_step"],
+                                    "tool":"*",
+                                    "status":"0",
+                                    "nonce":nonce,
+                                    "message":msg,
+                                    "type":"decision_rq"
+                            }
+                            self.AGU.mutate_workspace({"action_log": log_entry})
                         else:
                             _logger_specialist.info("message to user: %.80s", str(validated_result.get('content', '')))
                             nonce = random.randint(100000, 999999)
@@ -695,6 +707,11 @@ class Specialist:
             params['_entity_id'] = self._get_context().entity_id
             params['_thread'] = self._get_context().thread
             params['_init'] = handler_init
+
+            if tool_name in ('add_flight_rextur', 'add_flight'):
+                step_inputs = self._get_context().inputs or {}
+                if 'leg' not in params and 'leg' in step_inputs:
+                    params['leg'] = step_inputs['leg']
 
             _logger_specialist.debug("calling handler route=%s", handler_route)
 
