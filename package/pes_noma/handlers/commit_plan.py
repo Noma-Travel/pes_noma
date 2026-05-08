@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Any
 from decimal import Decimal
 #from jsonschema import validate, ValidationError
-from openai import OpenAI
+from langfuse.openai import OpenAI
 
 import json
 import logging

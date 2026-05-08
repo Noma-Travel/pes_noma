@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 import os
-from openai import OpenAI
+from langfuse.openai import OpenAI
 
 try:
     import yaml
