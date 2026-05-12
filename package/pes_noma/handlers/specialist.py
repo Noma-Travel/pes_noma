@@ -5,7 +5,7 @@ from renglo.common import load_config
 
 from openai import OpenAI
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -200,6 +200,60 @@ def verification_failure_guidance_for_model(handler_output: Any) -> str:
 VERIFICATION_FAILURE_LIMIT = 3
 
 
+def _resolve_action_hook_route(
+    list_tools: List[Dict[str, Any]], hook_target: str
+) -> Optional[Tuple[str, str]]:
+    """
+    ``schd_tools`` key → that row's ``handler`` route, or explicit ``ext/handler[/sub…]`` from JSON.
+    Returns ``(extension, handler_path)`` for ``SchdController.handler_call``.
+    """
+    ht = str(hook_target or "").strip()
+    if not ht:
+        return None
+    if "/" in ht:
+        parts = ht.split("/")
+        ext, hnd = parts[0], "/".join(parts[1:])
+        if ext and hnd:
+            return ext, hnd
+    for t in list_tools:
+        if t.get("key") == ht:
+            route = str(t.get("handler") or "").strip()
+            if not route or "/" not in route:
+                return None
+            parts = route.split("/")
+            return parts[0], "/".join(parts[1:])
+    return None
+
+
+def _hook_run_targets(raw: Any) -> List[str]:
+    """Normalize ``before.run`` / ``after.run`` to a list of hook target strings."""
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip()]
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if isinstance(x, (str, int)) and str(x).strip()]
+    return []
+
+
+def _accumulate_pipeline_payload(prev: Dict[str, Any], hook_out: Any) -> Dict[str, Any]:
+    """
+    Fold a hook handler's ``output`` into the growing pipeline dict.
+
+    Dict outputs are shallow-merged into ``prev``; other values are stored under
+    ``_hook_out_<n>`` so nothing is lost.
+    """
+    merged = dict(prev)
+    if hook_out is None:
+        return merged
+    if isinstance(hook_out, dict):
+        merged.update(hook_out)
+        return merged
+    idx = 0
+    while f'_hook_out_{idx}' in merged:
+        idx += 1
+    merged[f'_hook_out_{idx}'] = hook_out
+    return merged
+
+
 @dataclass
 class RequestContext:
     """Request-scoped context for agent operations."""
@@ -261,7 +315,229 @@ class Specialist:
             setattr(context, key, value)
         self._set_context(context)
 
+    def _dispatch_action_hook(
+        self,
+        *,
+        hook_target: str,
+        params: Dict[str, Any],
+        stack_action: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Resolve ``hook_target`` (``schd_tools`` key or ``ext/handler``) and ``handler_call`` with ``params``.
+        Returns ``(ok, stack_row)``; ``stack_row`` is always safe to ``results.append``.
+        """
+        ht = str(hook_target or "").strip()
+        stack_row: Dict[str, Any] = {
+            "success": False,
+            "action": stack_action,
+            "input": ht,
+            "output": None,
+        }
+        if not ht:
+            msg = "empty hook target"
+            stack_row["output"] = msg
+            self.AGU.print_chat(f"{stack_action}: {msg}", "error")
+            self._update_context(execute_intention_error=msg)
+            return False, stack_row
 
+        resolved = _resolve_action_hook_route(self._get_context().list_tools, ht)
+        if not resolved:
+            msg = f"cannot resolve route for {ht!r}"
+            stack_row["output"] = msg
+            self.AGU.print_chat(f"{stack_action}: {msg}", "error")
+            self._update_context(execute_intention_error=msg)
+            return False, stack_row
+
+        ext, hnd = resolved
+        try:
+            resp = self.SHC.handler_call(
+                self._get_context().portfolio,
+                self._get_context().org,
+                ext,
+                hnd,
+                dict(params),
+            )
+            stack_row["success"] = bool(resp.get("success"))
+            stack_row["output"] = resp.get("output")
+            if not resp.get("success"):
+                self._update_context(
+                    execute_intention_error=str(
+                        resp.get("output") or f"{stack_action} failed"
+                    )
+                )
+            return stack_row["success"], stack_row
+        except Exception as exc:
+            msg = f"{stack_action} {ht!r}: {exc}"
+            self.AGU.print_chat(msg, "error")
+            self._update_context(execute_intention_error=str(exc))
+            stack_row["output"] = str(exc)
+            return False, stack_row
+
+    def before_hook(
+        self,
+        *,
+        response_1: Dict[str, Any],
+        results: List[Any],
+        hooks: Dict[str, Any],
+        completed_tools_this_turn: Set[str],
+    ) -> Tuple[str, str]:
+        """
+        Apply ``hooks[tool].before`` (``requires_prior_tool``, ``run`` pipeline).
+
+        Mutates ``response_1['output']['tool_calls'][0]['function']['arguments']`` when
+        ``before.run`` ran successfully.
+
+        Returns ``(status, sel_tool)`` where ``status`` is ``''`` or ``'tool_error'``, and
+        ``sel_tool`` is the selected tool name (may be empty if malformed).
+        """
+        out = response_1.get('output') or {}
+        tcs = out.get('tool_calls') or []
+        if not tcs:
+            return '', ''
+        sel_tool = str(((tcs[0].get('function') or {}).get('name')) or '').strip()
+        _tool_hooks = hooks.get(sel_tool) if isinstance(hooks, dict) else None
+        _before = (
+            (_tool_hooks or {}).get('before')
+            if isinstance(_tool_hooks, dict)
+            and isinstance((_tool_hooks or {}).get('before'), dict)
+            else {}
+        )
+        if not isinstance(_before, dict):
+            return '', sel_tool
+
+        _need = _before.get('requires_prior_tool')
+        if isinstance(_need, str) and _need.strip():
+            _need = _need.strip()
+            if _need not in completed_tools_this_turn:
+                _msg = (
+                    f'Hook requires_prior_tool: run {_need!r} before {sel_tool!r} in this step.'
+                )
+                self.AGU.print_chat(_msg, 'error')
+                self._update_context(execute_intention_error=_msg)
+                results.append(
+                    {
+                        'success': False,
+                        'action': 'hook_before',
+                        'input': sel_tool,
+                        'output': _msg,
+                    }
+                )
+                return 'tool_error', sel_tool
+
+        _fn0 = tcs[0].get('function') or {}
+        _raw_args = _fn0.get('arguments')
+        _tool_arg_payload: Dict[str, Any] = (
+            json.loads(_raw_args)
+            if isinstance(_raw_args, str)
+            else (dict(_raw_args) if isinstance(_raw_args, dict) else {})
+        )
+        _before_run_targets = _hook_run_targets(_before.get('run'))
+        _acc_before = dict(_tool_arg_payload)
+        for _hid in _before_run_targets:
+            _ok, _row = self._dispatch_action_hook(
+                hook_target=_hid,
+                params=dict(_acc_before),
+                stack_action='hook_before_run',
+            )
+            results.append(_row)
+            if not _ok:
+                return 'tool_error', sel_tool
+            _acc_before = _accumulate_pipeline_payload(_acc_before, _row.get('output'))
+        if _before_run_targets:
+            _fn0['arguments'] = json.dumps(_acc_before, cls=UniversalEncoder)
+        return '', sel_tool
+
+    def after_hook(
+        self,
+        *,
+        response_1: Dict[str, Any],
+        response_2: Dict[str, Any],
+        results: List[Any],
+        hooks: Dict[str, Any],
+        sel_tool: str,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Apply ``hooks[tool].after`` only after a **successful** ``act()`` (no ``after.run`` on tool failure).
+
+        Updates persisted tool row + workspace cache when ``after.run`` is configured.
+        Returns ``(tool_flag, interpret_mode)`` where ``interpret_mode`` is ``None``,
+        ``'no_tools'``, or ``'skip'``.
+        """
+        _tool_hooks = hooks.get(sel_tool) if isinstance(hooks, dict) else None
+        _after = (
+            (_tool_hooks or {}).get('after')
+            if isinstance(_tool_hooks, dict)
+            and isinstance((_tool_hooks or {}).get('after'), dict)
+            else {}
+        )
+        if not isinstance(_after, dict):
+            return '', None
+
+        tool_flag = ''
+        _after_targets = _hook_run_targets(_after.get('run'))
+        if _after_targets:
+            _to = response_2.get('output') or {}
+            _tc = _to.get('content')
+            try:
+                _parsed_tool_out = (
+                    json.loads(_tc) if isinstance(_tc, str) else _tc
+                )
+            except json.JSONDecodeError:
+                _parsed_tool_out = _tc
+            _acc_after: Dict[str, Any] = {'output': _parsed_tool_out}
+            for _run_hook in _after_targets:
+                _ok2, _row2 = self._dispatch_action_hook(
+                    hook_target=_run_hook,
+                    params=dict(_acc_after),
+                    stack_action='hook_after_run',
+                )
+                results.append(_row2)
+                if not _ok2:
+                    tool_flag = 'tool_error'
+                    break
+                _acc_after = _accumulate_pipeline_payload(
+                    _acc_after, _row2.get('output')
+                )
+            if tool_flag != 'tool_error':
+                _new_body = sanitize(_acc_after.get('output', _acc_after))
+                _to['content'] = json.dumps(_new_body, cls=UniversalEncoder)
+                self.AGU.save_chat(
+                    dict(_to),
+                    interface=None,
+                    next=self._get_context().tool_response_c_id,
+                )
+                _lh = self._get_context().list_handlers or {}
+                _hroute = _lh.get(sel_tool) or ''
+                if _hroute:
+                    _fn = (response_1.get('output') or {}).get('tool_calls', [{}])[0].get(
+                        'function'
+                    ) or {}
+                    _tinput = _fn.get('arguments')
+                    _tio = (
+                        json.loads(_tinput)
+                        if isinstance(_tinput, str)
+                        else _tinput
+                    )
+                    self.AGU.mutate_workspace(
+                        {
+                            'cache': {
+                                f'irn:tool_rs:{_hroute}': {
+                                    'input': _tio,
+                                    'output': _new_body,
+                                }
+                            }
+                        },
+                        workspace_id=self._get_context().workspace_id,
+                    )
+
+        interpret_mode: Optional[str] = None
+        if tool_flag != 'tool_error':
+            _im = str(_after.get('interpret_mode') or '').strip().lower()
+            if _im == 'no_tools':
+                interpret_mode = 'no_tools'
+            elif _im == 'skip':
+                interpret_mode = 'skip'
+        return tool_flag, interpret_mode
 
     def consent_form(self,payload):
         function = 'consent_form'
@@ -315,6 +591,17 @@ class Specialist:
             message_list = self.AGU.get_message_history(filter=message_filter)
 
             #print(f'Specialist Message History: {message_list}')
+
+            # Fresh execution of this step (tool_step=0) must not inherit old specialist turns for
+            # the same plan_id/step_id pair (e.g., after plan revision preserving plan_id).
+            # Otherwise stale prior arguments can bias the LLM.
+            tool_step = str(continuity.get("tool_step", "0") or "0")
+            if tool_step in ("0", ""):
+                message_list = {'output': []}
+                print(
+                    'Interpret() >> Fresh step execution; ignoring prior specialist history '
+                    f'for plan_id={continuity.get("plan_id")} step={continuity.get("plan_step")}'
+                )
 
             #If the message_list comes back empty, that means the specialist execution is new. Create into message
             if not message_list['output']:
@@ -568,7 +855,6 @@ class Specialist:
                 if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
-
                     if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
                         print(f'Interpret() >> Run this tool:{validated_result}')
                         # The last message was a response to "3 = WAITING HUMAN".
@@ -1255,6 +1541,15 @@ class Specialist:
             # Save Action document. The specialist will follow it.
             self.AGU.mutate_workspace({'action': context.current_action})
 
+            # Optional per-tool hooks from the governing action document (schd_actions row).
+            hooks: Dict[str, Any] = {}
+            for _ad in context.list_actions:
+                if isinstance(_ad, dict) and _ad.get('key') == context.current_action:
+                    _h = _ad.get('hooks')
+                    if isinstance(_h, dict):
+                        hooks = _h
+                    break
+
             # Run the ReAct loop
 
             loops = 0
@@ -1262,9 +1557,26 @@ class Specialist:
             tool_result = ''
             verification_result = ''
             verification_fail_streak = 0
+            completed_tools_this_turn: Set[str] = set()
+            interpret_override: Optional[str] = None  # "no_tools" | "skip" (see action hooks.after.interpret_mode)
             while loops < loop_limit:
                 loops = loops + 1
                 print(f'Loop iteration {loops}/{loop_limit}')
+
+                if interpret_override == 'skip':
+                    interpret_override = None
+                    self.AGU.print_chat('🤖', 'transient')
+                    output = {'status': 'awaiting', 'hook_interpret_skipped': True}
+                    c_id = getattr(self._get_context(), 'tool_response_c_id', None)
+                    if c_id:
+                        output['next'] = c_id
+                    return {
+                        'success': True,
+                        'action': action,
+                        'input': payload,
+                        'output': output,
+                        'stack': results,
+                    }
 
                 if loops == 1:
                     preflight_out = self.verify_preflight(context.current_action)
@@ -1291,7 +1603,10 @@ class Specialist:
                         }
 
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
-                response_1 = self.interpret(tool_result=tool_result)
+                use_no_tools_hook = interpret_override == 'no_tools'
+                if use_no_tools_hook:
+                    interpret_override = None
+                response_1 = self.interpret(no_tools=use_no_tools_hook, tool_result=tool_result)
                 tool_result = ''
 
                 print(f'Run() >> Response from interpret: {response_1}')
@@ -1313,14 +1628,35 @@ class Specialist:
                 # Check whether we need to run a tool
 
                 if 'tool_calls' in response_1['output'] and response_1['output']['tool_calls']:
-                    # Tool need Execution
-                    # Step 2: Act. Agent runs the tool
+                    # Tool need Execution — optional hooks.before, then act(), then hooks.after on success
+                    _bh, sel_tool = self.before_hook(
+                        response_1=response_1,
+                        results=results,
+                        hooks=hooks,
+                        completed_tools_this_turn=completed_tools_this_turn,
+                    )
+                    if _bh == 'tool_error':
+                        tool_result = 'tool_error'
+                        continue
 
                     print(f'Run() >> Tool Execution:{response_1["output"]}')
                     response_2 = self.act(response_1['output'])
                     results.append(response_2)
                     tool_result = 'fresh_results'
 
+                    if response_2.get('success') and sel_tool:
+                        completed_tools_this_turn.add(sel_tool)
+                        _tf, _im = self.after_hook(
+                            response_1=response_1,
+                            response_2=response_2,
+                            results=results,
+                            hooks=hooks,
+                            sel_tool=sel_tool,
+                        )
+                        if _tf == 'tool_error':
+                            tool_result = 'tool_error'
+                        if _im:
+                            interpret_override = _im
 
                     if not response_2['success']:
                         tool_result = 'tool_error'
@@ -1333,6 +1669,16 @@ class Specialist:
                             else "Tool run failed before verification could run. Check the tool response and try again."
                         )
                         self.AGU.print_chat(fail_msg, 'text')
+                        continue
+
+                    if tool_result == 'tool_error' and response_2.get('success'):
+                        self.AGU.print_chat(
+                            str(
+                                getattr(self._get_context(), 'execute_intention_error', '')
+                                or 'Hook failed after tool.'
+                            ),
+                            'text',
+                        )
                         continue
                     
                     '''
