@@ -21,12 +21,17 @@ from decimal import Decimal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import logging
+
 from renglo.agent.agent_utilities import AgentUtilities
 from renglo.common import load_config
 from renglo.data.data_controller import DataController
 from renglo.blueprint.blueprint_controller import BlueprintController
+from renglo.debug_json import djson
 
 from contextvars import ContextVar
+
+logger = logging.getLogger("agent.planner")
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -759,12 +764,12 @@ class IntentGenerator:
                   cases: Optional[List[VDBItem]] = None, facts: Optional[List[VDBItem]] = None,
                   skills: Optional[List[VDBItem]] = None) -> Optional[Dict[str, Any]]:
         """Extract requirements from user message. Examples from VDB inform how to structure the intent."""
-        print('Extracting trip intent from user request...')
         user_message = req.get("request", "") if isinstance(req.get("request"), str) else json.dumps(req)
         if isinstance(user_message, dict):
             user_message = req.get("message", "") or json.dumps(req)
         user_message = str(user_message).strip() if user_message else ""
-        print(f'[DEBUG] User message: {user_message}')
+        logger.info("to_intent_start | msg_len=%d", len(user_message))
+        logger.debug("to_intent_input | msg=%.200s", user_message)
 
         try:
             tz = ZoneInfo("America/New_York")
@@ -800,7 +805,6 @@ class IntentGenerator:
 
         prompt_template = self.prompts.get('to_intent', '')
         if prompt_template:
-            print('Using "to_intent" prompt template')
             replacements = {
                 'request_text': user_message, 'current_time': now_iso, 'now_date': now_date,
                 'intent_examples': intent_examples or '[]', 'fact_texts': fact_texts or '[]'
@@ -810,7 +814,6 @@ class IntentGenerator:
                 prompt += f"\n\nEXAMPLE INTENTS (learn structure from these):\n```json\n{intent_examples}\n```"
         else:
             # FALLBACK: used when pes_prompts.to_intent is empty; domain-specific (trips)
-            print('Using default prompt')
             prompt = f"""You are a travel requirements extractor. Extract trip details from the user message.
 
 Time context: Today is {now_date} ({now_iso}). Use YYYY-MM-DD for all dates. Dates must be on or after today.
@@ -871,14 +874,16 @@ User message: {user_message}
                 prompt += f"\n\nRELEVANT FACTS:\n```json\n{fact_texts}\n```"
 
         #Run the prompt
-        print(f'[to_intent] prompt > LLM >> {prompt}')
+        djson("generate_plan_llm_prompt.json", {"prompt": prompt, "model": self.llm.model})
         data = self.llm.complete_json(prompt)
+        djson("generate_plan_llm_response.json", data)
         if not data:
-            print('[ERROR] LLM returned no data for intent')
+            logger.error("to_intent_llm_empty")
             return None
 
-        print('[DEBUG] LLM results:', json.dumps(data, indent=2))
+        logger.debug("to_intent_llm_result | keys=%s", list(data.keys()) if data else [])
         extracted = self._merge_extract_into_intent(intent, data, now_date)
+        djson("generate_plan_intent.json", extracted)
         return extracted
 
     def _merge_extract_into_intent(self, intent: Dict[str, Any], extracted: Dict[str, Any], now_date: str) -> Dict[str, Any]:
@@ -1300,7 +1305,7 @@ User message: {user_message}
     # 2) Retrieval via VectorDB - used to inform intent extraction (examples inform intent, not plan)
     def retrieve(self, query: Union[str, Dict[str, Any]], k_cases: int = 4, k_facts: int = 4, k_skills: int = 6):
         """Retrieve cases, facts, skills. query can be user message (str) or intent (dict)."""
-        print('Retrieving cases, facts and skills from agent experience...')
+        logger.info("retrieval_start | k_cases=%d | k_facts=%d | k_skills=%d", k_cases, k_facts, k_skills)
         if isinstance(query, dict):
             query_str = json.dumps(intent_for_retrieval(query), sort_keys=True, separators=(",", ":"))
             dest = intent_destination(query)
@@ -1336,9 +1341,6 @@ User message: {user_message}
 
         score_map = {s["skill_id"]: s["score"] for s in scored}
         skills_ranked = sorted(skills, key=lambda s: score_map.get(s.id, 0), reverse=True)
-        #print('Cases:',cases)
-        #print('Facts:',facts)
-        #print('Skills:',skills_ranked)
         return {'cases':cases, 'facts':facts, 'skills':skills_ranked}
 
         '''
@@ -1440,9 +1442,11 @@ class GeneratePlan:
         Returns all explicitly mentioned names (may exceed n_travelers if the LLM found more).
         """
         prompt_text = f"""Extract the names of ALL travelers explicitly mentioned in the travel request below.
-Return ONLY a JSON array of strings with the names, e.g. ["Arthur", "Maria Silva"].
-If no names are mentioned return [].
-Do not invent names. Include every person explicitly named in the request.
+Return ONLY a JSON array of strings. Examples:
+- "Book for John and Sarah" → ["John", "Sarah"]
+- "2 adults from NYC to LA" → []
+- "Trip for me" → []
+If no names are explicitly mentioned, return []. Do not invent or infer names.
 
 Travel request: {user_message}"""
         try:
@@ -1460,7 +1464,7 @@ Travel request: {user_message}"""
             if isinstance(names, list):
                 return [n for n in names if isinstance(n, str) and n.strip()]
         except Exception as e:
-            print(f"[generate_plan] _extract_names_from_message error: {e}")
+            logger.error("extract_names_failed | %s", e)
         return []
 
     def _resolve_traveler_ids_in_intent(
@@ -1484,16 +1488,15 @@ Travel request: {user_message}"""
         try:
             attendants = self._fetch_all_attendants(portfolio, org)
         except Exception as e:
-            print(f"[generate_plan] _fetch_all_attendants error: {e}")
+            logger.error("fetch_attendants_failed | %s", e)
             return intent
 
-        print(f"[generate_plan] fetched {len(attendants)} attendants from noma_attendants")
+        logger.info("attendants_fetched | count=%d", len(attendants))
         if not attendants:
-            print(f"[generate_plan] no attendants found — skipping traveler resolution")
             return intent
 
         names = self._extract_names_from_message(user_message, n_travelers)
-        print(f"[generate_plan] extracted traveler names: {names}")
+        logger.debug("traveler_names_extracted | names=%s", names)
 
         if not names:
             return intent
@@ -1521,7 +1524,7 @@ Travel request: {user_message}"""
                     if "traveler_ids" in stay and new_sid not in stay["traveler_ids"]:
                         stay["traveler_ids"].append(new_sid)
                 next_num += 1
-            print(f"[generate_plan] Extended synthetic_ids to {synthetic_ids}")
+            logger.debug("synthetic_ids_extended | ids=%s", synthetic_ids)
 
         id_map: Dict[str, Optional[str]] = {}
         unresolved: List[Dict[str, Any]] = []
@@ -1535,7 +1538,7 @@ Travel request: {user_message}"""
 
             if len(exact) == 1:
                 id_map[synthetic_id] = exact[0]['_id']
-                print(f"[generate_plan] {synthetic_id} → {exact[0]['_id']} (name: {exact[0].get('name')})")
+                logger.debug("traveler_resolved_exact | %s → %s", synthetic_id, exact[0]['_id'])
             elif len(exact) > 1:
                 alternatives = [{"id": a["_id"], "name": a.get("name", ""), "email": a.get("email", "")} for a in exact]
                 unresolved.append({
@@ -1545,12 +1548,12 @@ Travel request: {user_message}"""
                     "alternatives": alternatives,
                     "message": f'Multiple attendants match "{name}": {", ".join(a["name"] for a in alternatives)}. Please clarify which one.',
                 })
-                print(f"[generate_plan] {synthetic_id}: ambiguous name '{name}'")
+                logger.warning("traveler_ambiguous | id=%s | name=%s", synthetic_id, name)
             else:
                 best, ratio = self._find_attendant_fuzzy(name, attendants)
                 if best and ratio >= 0.8:
                     id_map[synthetic_id] = best['_id']
-                    print(f"[generate_plan] {synthetic_id} → {best['_id']} (fuzzy {ratio:.2f}, name: {best.get('name')})")
+                    logger.debug("traveler_resolved_fuzzy | %s → %s | ratio=%.2f", synthetic_id, best['_id'], ratio)
                 else:
                     unresolved.append({
                         "synthetic_id": synthetic_id,
@@ -1558,7 +1561,7 @@ Travel request: {user_message}"""
                         "type": "not_found",
                         "message": f'No attendant found matching "{name}".',
                     })
-                    print(f"[generate_plan] {synthetic_id}: no match for '{name}'")
+                    logger.warning("traveler_no_match | id=%s | name=%s", synthetic_id, name)
 
         if not id_map:
             if unresolved:
@@ -1638,8 +1641,7 @@ Travel request: {user_message}"""
                     elif key == 'compose_plan':
                         prompts['compose_plan'] = prompt_text
         except Exception as e:
-            print(f'Warning: Could not load prompts from database: {str(e)}')
-
+            logger.warning("prompts_db_load_failed | %s", e)
 
         return prompts
 
@@ -1655,14 +1657,14 @@ Travel request: {user_message}"""
         Returns:
             Dictionary with keys: 'to_intent', 'compose_plan'
         """
-        print('Using prompts from package')
+        logger.debug("prompts_source=package")
 
         prompts = {
             'to_intent': '',
             'compose_plan': ''
         }
         if not yaml:
-            print('Warning: PyYAML not installed. Cannot load prompts from package.')
+            logger.warning("yaml_not_installed")
             return prompts
         try:
             parts = package_route.split('.')
@@ -1690,9 +1692,9 @@ Travel request: {user_message}"""
                         if key in prompts:
                             prompts[key] = prompt_text
                     except Exception as e:
-                        print(f'Warning: Could not load prompt from {entry.name}: {e}')
+                        logger.warning("prompt_file_load_failed | %s | %s", entry.name, e)
         except Exception as e:
-            print(f'Warning: Could not load prompts from package {package_route}: {e}')
+            logger.warning("prompts_package_load_failed | %s | %s", package_route, e)
         return prompts
 
     def _load_actions(self, portfolio: str, org: str, action_ring: str = "schd_actions") -> List[ActionSpec]:
@@ -1743,7 +1745,7 @@ Travel request: {user_message}"""
                                 parts = [p.strip() for p in slots.replace('\n', ',').split(',') if p.strip()]
                                 required_args = parts
                         except Exception as e:
-                            print(f'Warning: Could not parse slots for action {name or key}: {str(e)}')
+                            logger.warning("action_slots_parse_failed | %s | %s", name or key, e)
 
                     # Use goal as description, or fallback to name
                     description = goal or f"Action: {name or key}"
@@ -1761,8 +1763,7 @@ Travel request: {user_message}"""
                             success_criteria_hint=success_criteria_hint
                         ))
         except Exception as e:
-            print(f'Warning: Could not load actions from database: {str(e)}')
-
+            logger.warning("actions_db_load_failed | %s", e)
 
         return actions
 
@@ -1801,7 +1802,7 @@ Travel request: {user_message}"""
                             'plan': plan_data
                         })
         except Exception as e:
-            print(f'Warning: Could not load seed cases from database: {str(e)}')
+            logger.warning("seed_cases_db_load_failed | %s", e)
 
         return cases
 
@@ -1840,7 +1841,7 @@ Travel request: {user_message}"""
                             'meta': meta
                         })
         except Exception as e:
-            print(f'Warning: Could not load facts from database: {str(e)}')
+            logger.warning("facts_db_load_failed | %s", e)
 
         return facts
 
@@ -1891,7 +1892,7 @@ Travel request: {user_message}"""
 
         # Note: If no actions are loaded from database, action_catalog will be empty
         if not action_catalog_specific:
-            print('Warning: No actions loaded from database, action_catalog_specific will be empty')
+            logger.warning("action_catalog_empty")
 
         # Load seed cases from database
         seed_cases = self._load_seed_cases(portfolio, org, case_ring, case_group=case_group)
@@ -1909,7 +1910,7 @@ Travel request: {user_message}"""
 
         # Note: If no seed cases are loaded from database, VDB will be empty
         if not seed_cases:
-            print('Warning: No seed cases loaded from database, VDB will be empty')
+            logger.warning("vdb_seed_cases_empty")
 
         # Load facts from database
         facts = self._load_facts(portfolio, org, fact_ring, case_group=case_group)
@@ -1927,7 +1928,7 @@ Travel request: {user_message}"""
 
         # Note: If no facts are loaded from database, VDB will not have facts
         if not facts:
-            print('Warning: No facts loaded from database, VDB will not have facts')
+            logger.warning("vdb_facts_empty")
 
         return IntentGenerator(vdb=vdb, llm=llm, action_catalog=action_catalog_specific, prompts=prompts)
 
@@ -1944,7 +1945,6 @@ Travel request: {user_message}"""
         '''
         # Initialize a new request context
         function = 'run > generate_plan'
-        print(f'Running:{function}')
         context = RequestContext()
 
         if 'portfolio' in payload:
@@ -1986,16 +1986,13 @@ Travel request: {user_message}"""
                 entity_id,
                 thread
             )
-            print("Agent Utilities initialized")
 
             if 'plan_actions' in context.init:
                 plan_actions = context.init['plan_actions']
             else:
                 plan_actions = ''
-            print(f'Plan Actions loaded:{plan_actions}')
 
             results = []
-            print('Initializing PES>GeneratePlan')
             intent_generator = self.build_intent_generator(
                 portfolio=context.portfolio,
                 org=context.org,
@@ -2004,9 +2001,9 @@ Travel request: {user_message}"""
                 case_ring="pes_cases",
                 plan_actions=plan_actions
             )
-            print('Finished building Plan Generator')
 
             user_message = payload.get("message", "").strip()
+            logger.info("generate_plan_start | entity=%s | msg=%.80s", entity_id, user_message)
             req = {"request": user_message, "message": user_message}
 
 
@@ -2025,14 +2022,14 @@ Travel request: {user_message}"""
                 context.portfolio,
                 context.org,
             )
-            print(f"[generate_plan] Intent after traveler resolution: traveler_ids={intent.get('party', {}).get('traveler_ids')}")
+            logger.debug("traveler_resolution_done | traveler_ids=%s", intent.get('party', {}).get('traveler_ids'))
 
             self.AGU.mutate_workspace(
                 {'request_intent': intent},
                 public_user=public_user,
                 workspace_id=workspace_id
             )
-            print('Intent stored in workspace')
+            logger.info("generate_plan_done | workspace_id=%s | traveler_ids=%s", workspace_id, intent.get('party', {}).get('traveler_ids'))
 
 
             # Step 2: Generate Plan
@@ -2058,5 +2055,5 @@ Travel request: {user_message}"""
             return {'success': True, 'interface': 'plan', 'input': payload, 'output': canonical, 'stack': results}
 
         except Exception as e:
-            print(f'Error during execution: {str(e)}')
+            logger.error("generate_plan_failed | %s", e)
             return {'success': False, 'function': function, 'input': payload, 'output': f'ERROR:@generate_plan/run: {str(e)}'}

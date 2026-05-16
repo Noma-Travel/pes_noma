@@ -142,26 +142,136 @@ class ProposePlan:
             print(f'Warning: Could not load actions: {e}')
         return actions
 
-    def _validate_and_patch_plan(self, plan: Plan, action_catalog: List[ActionSpec]) -> Plan:
+    def _repair_step_inputs_from_intent(
+        self,
+        step: PlanStep,
+        intent: Dict[str, Any],
+        seg_idx: int,
+        stay_idx: int,
+    ) -> PlanStep:
+        """
+        Best-effort repair for missing required inputs using intent.
+        This is intentionally permissive: if we can infer a slot, we fill it; otherwise we leave it.
+        """
+        iti = intent.get("itinerary") or {}
+        lod = iti.get("lodging") or {}
+        segs = iti.get("segments") or []
+        stays = lod.get("stays") or []
+        party_tids = (intent.get("party") or {}).get("traveler_ids") or []
+
+        inputs = step.inputs or {}
+        step.inputs = inputs
+
+        if step.action in ("quote_flight", "quote_train_bus"):
+            seg = segs[seg_idx] if seg_idx < len(segs) else None
+            if seg:
+                origin = seg.get("origin") or {}
+                dest = seg.get("destination") or {}
+                origin_code = origin.get("code") if isinstance(origin, dict) else origin
+                dest_code = dest.get("code") if isinstance(dest, dict) else dest
+
+                if step.action == "quote_flight":
+                    inputs.setdefault("from_airport_code", origin_code)
+                    inputs.setdefault("to_airport_code", dest_code)
+                else:
+                    # For train/bus in this codebase we use "departure_city"/"arrival_city"
+                    inputs.setdefault("departure_city", origin_code)
+                    inputs.setdefault("arrival_city", dest_code)
+
+                inputs.setdefault("departure_date", seg.get("depart_date"))
+                inputs.setdefault("leg", inputs.get("leg"))
+                inputs.setdefault("passengers", seg.get("passengers"))
+                inputs.setdefault("traveler_ids", seg.get("traveler_ids") or party_tids)
+            else:
+                inputs.setdefault("traveler_ids", party_tids)
+
+        elif step.action == "quote_hotel":
+            stay = stays[stay_idx] if stay_idx < len(stays) else None
+            if stay:
+                loc = stay.get("location_code") or stay.get("city") or stay.get("location")
+                inputs.setdefault("city", loc)
+                inputs.setdefault("area", inputs.get("area"))
+                inputs.setdefault("check_in_date", stay.get("check_in"))
+                # number_of_nights / number_of_guests are strings in most prompts/tooling here
+                if "number_of_nights" not in inputs or inputs.get("number_of_nights") in (None, ""):
+                    try:
+                        from datetime import datetime
+                        ci = stay.get("check_in")
+                        co = stay.get("check_out")
+                        if ci and co:
+                            ci_dt = datetime.strptime(str(ci)[:10], "%Y-%m-%d")
+                            co_dt = datetime.strptime(str(co)[:10], "%Y-%m-%d")
+                            nights = max(1, (co_dt - ci_dt).days)
+                            inputs["number_of_nights"] = str(nights)
+                    except Exception:
+                        pass
+                if "number_of_guests" not in inputs or inputs.get("number_of_guests") in (None, ""):
+                    ng = stay.get("number_of_guests")
+                    if ng is not None:
+                        inputs["number_of_guests"] = str(ng)
+                inputs.setdefault("traveler_ids", stay.get("traveler_ids") or party_tids)
+            else:
+                inputs.setdefault("traveler_ids", party_tids)
+
+        else:
+            if party_tids and not inputs.get("traveler_ids"):
+                inputs["traveler_ids"] = party_tids
+
+        return step
+
+    def _validate_and_patch_plan(
+        self,
+        plan: Plan,
+        action_catalog: List[ActionSpec],
+        intent: Optional[Dict[str, Any]] = None,
+    ) -> Plan:
         print(f'Validating plan with {len(plan.steps)} steps...')
         known = {t.key: t for t in action_catalog}
         validated: List[PlanStep] = []
+        seg_idx = 0
+        stay_idx = 0
         for s in plan.steps:
             if not s.action or s.action == "":
                 continue
             if s.action not in known:
+                # Unknown action: keep it only if we have *some* steps already (avoid returning empty),
+                # otherwise we'll rely on fallback generation from intent below.
+                if validated:
+                    if not s.enter_guard:
+                        s.enter_guard = "True"
+                    validated.append(s)
                 continue
             spec = known[s.action]
             inputs = s.inputs or {}
-            missing = [a for a in spec.required_args if a not in inputs]
+            # Repair inputs from intent before deciding to drop the step.
+            if intent is not None:
+                self._repair_step_inputs_from_intent(s, intent=intent, seg_idx=seg_idx, stay_idx=stay_idx)
+                inputs = s.inputs or {}
+
+            missing = [a for a in spec.required_args if a not in inputs or inputs.get(a) in (None, "", [])]
             if missing:
+                # If we can't satisfy the action's required slots, drop this step.
+                # We'll later fallback to programmatic plan generation if everything gets dropped.
                 continue
             if not s.success_criteria and spec.success_criteria_hint:
                 s.success_criteria = spec.success_criteria_hint
             if not s.enter_guard:
                 s.enter_guard = "True"
             validated.append(s)
+            if s.action in ("quote_flight", "quote_train_bus"):
+                seg_idx += 1
+            if s.action == "quote_hotel":
+                stay_idx += 1
         plan.steps = validated
+
+        # Never allow empty steps if intent contains enough information to build a plan.
+        # This is the "it should always generate when generate_plan works" guarantee.
+        if (not plan.steps) and intent is not None:
+            fallback = self._build_plan_from_intent(intent, plan_id=plan.id, action_catalog=action_catalog)
+            fallback = self._inject_traveler_ids_from_intent(fallback, intent)
+            # Validate once more, but keep fallback steps even if the catalog is incomplete.
+            if fallback.steps:
+                plan = fallback
         return plan
 
     def _inject_traveler_ids_from_intent(self, plan: Plan, intent: Dict[str, Any]) -> Plan:
@@ -428,7 +538,7 @@ class ProposePlan:
         tid = (target_plan_id or '').strip()
         plan_id = tid or uuid.uuid4().hex[:8]
         plan = self._build_plan_from_intent(intent, plan_id, action_catalog)
-        return self._validate_and_patch_plan(plan, action_catalog)
+        return self._validate_and_patch_plan(plan, action_catalog, intent=intent)
 
     def compose_from_cases(
         self,
@@ -515,7 +625,7 @@ Each PlanStep: {{"step_id": 0, "title": "...", "action": "<from catalog>", "inpu
         resolved_id = tid or data['plan'].get('id') or plan_id
         plan = Plan(id=resolved_id, steps=steps, meta=data['plan'].get('meta', {}))
         plan = self._inject_traveler_ids_from_intent(plan, intent)
-        return self._validate_and_patch_plan(plan, action_catalog)
+        return self._validate_and_patch_plan(plan, action_catalog, intent=intent)
 
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         function = 'run > propose_plan'
