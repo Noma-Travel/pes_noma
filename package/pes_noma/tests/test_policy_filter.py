@@ -9,7 +9,7 @@ import sys
 import os
 
 # Add noma package to path (policy_filter lives in the noma extension)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..', 'noma', 'package'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..', 'backend', 'package'))
 
 from noma.handlers.policy_filter import (
     _parse_price,
