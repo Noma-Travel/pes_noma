@@ -201,94 +201,6 @@ def verification_failure_guidance_for_model(handler_output: Any) -> str:
 VERIFICATION_FAILURE_LIMIT = 3
 
 
-def _message_explicitly_requests_plan_rewrite(user_message: Optional[str]) -> bool:
-    """Conservative guard: True when wording clearly asks to rewrite the active plan."""
-    m = str(user_message or '').strip().lower()
-    if not m:
-        return False
-    phrase_hints = (
-        'change the plan',
-        'modify the plan',
-        'update the plan',
-        'revise the plan',
-        'rewrite the plan',
-        'replace the plan',
-        'entire plan',
-        'whole plan',
-        'move the plan',
-        'shift the plan',
-        'reschedule the plan',
-        'change the timeline',
-        'change the start date',
-        'move the start date',
-    )
-    if any(h in m for h in phrase_hints):
-        return True
-    if re.search(
-        r'\b(week|weeks|month|months|day|days)\s+(later|earlier)\b',
-        m,
-    ):
-        return True
-    return False
-
-
-def _message_is_plain_tool_consent_reply(user_message: Optional[str]) -> bool:
-    """
-    True only for short yes/no-style confirmations that should resume the exact pending tool call.
-    Rejects wording that changes constraints/dates/scope.
-    """
-    m = str(user_message or '').strip().lower()
-    if not m or len(m) > 180:
-        return False
-    compact = re.sub(r'[\s,.!\'"]+', ' ', m).strip()
-    allow = {
-        'yes',
-        'y',
-        'ok',
-        'okay',
-        'sure',
-        'go ahead',
-        'proceed',
-        'please do',
-        'confirm',
-        'confirmed',
-        'approve',
-        'approved',
-        'sounds good',
-        'looks good',
-        'that works',
-        'run it',
-        'do it',
-        'no',
-        'n',
-        'cancel',
-        'stop',
-        "don't",
-        'dont',
-        'do not',
-        'abort',
-        'never mind',
-        'nevermind',
-    }
-    # Accept short acknowledgement first; this avoids false negatives when extra
-    # context is attached to the payload text upstream.
-    if compact in allow:
-        return True
-    tokens = compact.split()
-    if tokens and tokens[0] in {'yes', 'y', 'ok', 'okay', 'sure', 'no', 'n'} and len(tokens) <= 3:
-        return True
-    if _message_explicitly_requests_plan_rewrite(m):
-        return False
-    if re.search(
-        r'\b(change|modify|different|instead|reschedul|move|shift|update|date|timeline)\b',
-        m,
-    ):
-        return False
-    return compact in allow or (
-        compact.startswith('yes ') and len(compact.split()) <= 4 and 'change' not in compact
-    )
-
-
 def _resolve_action_hook_route(
     list_tools: List[Dict[str, Any]], hook_target: str
 ) -> Optional[Tuple[str, str]]:
@@ -499,19 +411,18 @@ class Specialist:
             _need = _need.strip()
             if _need not in completed_tools_this_turn:
                 _msg = (
-                    f'Hook requires_prior_tool: run {_need!r} before {sel_tool!r} in this step.'
+                    f'Hook requires_prior_tool advisory: {_need!r} not seen in current loop before {sel_tool!r}; '
+                    'continuing because tool history may come from a prior turn.'
                 )
-                self.AGU.print_chat(_msg, 'error')
-                self._update_context(execute_intention_error=_msg)
+                self.AGU.print_chat(_msg, 'transient')
                 results.append(
                     {
-                        'success': False,
+                        'success': True,
                         'action': 'hook_before',
                         'input': sel_tool,
                         'output': _msg,
                     }
                 )
-                return 'tool_error', sel_tool
 
         _fn0 = tcs[0].get('function') or {}
         _raw_args = _fn0.get('arguments')
@@ -650,6 +561,25 @@ class Specialist:
         }
 
         return consent
+
+    def _require_tool_consent(self) -> bool:
+        ets = self._get_context().executor_tool_settings
+        if not isinstance(ets, dict):
+            return True
+        raw = ets.get('require_tool_consent')
+        if raw is None:
+            return True
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v in ('1', 'true', 'yes', 'y', 'on'):
+                return True
+            if v in ('0', 'false', 'no', 'n', 'off'):
+                return False
+        return True
 
 
 
@@ -944,37 +874,8 @@ class Specialist:
                 if validated_result.get('tool_calls') and validated_result.get('role') == 'assistant':
                     # This is the LLM asking for a tool to be executed.
                     selected_tool = validated_result['tool_calls'][0]['function']['name']
-                    pending_consent = (
-                        str(continuity.get('tool_step') or '').strip() == '3'
-                        and str(continuity.get('action_step') or '').strip() == str(selected_tool)
-                    )
-                    if pending_consent and not _message_is_plain_tool_consent_reply(
-                        self._get_context().message
-                    ):
-                        msg = (
-                            "I paused this execution step because your last message looks like a "
-                            "change to the current trip plan, not a direct yes/no confirmation for "
-                            f"the pending `{selected_tool}` call. "
-                            "If you want to revise the plan, say that explicitly and I will route to "
-                            "plan modification; if you want to run the existing step as-is, reply with "
-                            "a clear yes/no only."
-                        )
-                        nonce = random.randint(100000, 999999)
-                        c_id = f'{c_id_pre}:*:1:{nonce}'
-                        blocked_reply = {'role': 'assistant', 'content': msg}
-                        self.AGU.save_chat(blocked_reply, next=c_id)
-                        log_entry = {
-                            "plan_id": continuity["plan_id"],
-                            "plan_step": continuity["plan_step"],
-                            "tool": selected_tool,
-                            "status": "3",
-                            "nonce": nonce,
-                            "message": msg,
-                            "type": "consent_blocked_plan_change",
-                        }
-                        self.AGU.mutate_workspace({"action_log": log_entry})
-                        validated_result = blocked_reply
-                    elif (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
+                    require_tool_consent = self._require_tool_consent()
+                    if (continuity['tool_step'] == '3' or continuity['tool_step'] == '4' ) and continuity['action_step'] == selected_tool :
                         print(f'Interpret() >> Run this tool:{validated_result}')
                         # The last message was a response to "3 = WAITING HUMAN".
                         # The continuity response matches with the selected_tool. Execute tool
@@ -997,28 +898,34 @@ class Specialist:
                         self.AGU.mutate_workspace({'action_log': log_entry})
 
                     else:
+                        if require_tool_consent:
+                            print(f'Interpret() >> Switching tool call into a message: {validated_result}')
+                            # We are turning the tool call into a message to the user
 
-                        print(f'Interpret() >> Switching tool call into a message: {validated_result}')
-                        # We are turning the tool call into a message to the user
+                            tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
+                            consent = self.consent_form(validated_result)
+                            c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
+                            self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
 
-                        tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
-                        consent = self.consent_form(validated_result)
-                        c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
-                        self.AGU.save_chat(consent['message'], msg_type='consent', next = c_id)
+                            validated_result = consent['message'] # Replacing original message with consent message.
 
-                        validated_result = consent['message'] # Replacing original message with consent message.
-
-                        # Recording it in the action_log
-                        log_entry = {
-                            "plan_id":continuity["plan_id"],
-                            "plan_step":continuity["plan_step"],
-                            "tool":selected_tool,
-                            "status":tool_step,
-                            "nonce":consent["nonce"],
-                            "message":consent["message"]["content"],
-                            "type":"consent_rq"
-                        }
-                        self.AGU.mutate_workspace({"action_log": log_entry})
+                            # Recording it in the action_log
+                            log_entry = {
+                                "plan_id":continuity["plan_id"],
+                                "plan_step":continuity["plan_step"],
+                                "tool":selected_tool,
+                                "status":tool_step,
+                                "nonce":consent["nonce"],
+                                "message":consent["message"]["content"],
+                                "type":"consent_rq"
+                            }
+                            self.AGU.mutate_workspace({"action_log": log_entry})
+                        else:
+                            print(f'Interpret() >> Tool consent disabled; auto-executing tool call: {validated_result}')
+                            nonce = random.randint(100000, 999999)
+                            tool_step = '4' # 4  = EXECUTION_REQUEST
+                            c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{nonce}'
+                            self.AGU.save_chat(validated_result, next = c_id)
 
 
 
@@ -1776,6 +1683,22 @@ class Specialist:
                             tool_result = 'tool_error'
                         if _im:
                             interpret_override = _im
+                            if _im == 'skip':
+                                self.AGU.print_chat('🤖', 'transient')
+                                output = {
+                                    'status': 'awaiting',
+                                    'hook_interpret_skipped': True,
+                                }
+                                c_id = getattr(self._get_context(), 'tool_response_c_id', None)
+                                if c_id:
+                                    output['next'] = c_id
+                                return {
+                                    'success': True,
+                                    'action': action,
+                                    'input': payload,
+                                    'output': output,
+                                    'stack': results,
+                                }
 
                     if not response_2['success']:
                         tool_result = 'tool_error'
