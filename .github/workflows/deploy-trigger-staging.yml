@@ -21,5 +21,5 @@ jobs:
               "triggered_by": "${{ github.actor }}",
               "source_repo": "${{ github.repository }}",
               "commit_author_email": "${{ github.event.head_commit.author.email }}",
-              "commit_message": "${{ github.event.head_commit.message }}"
+              "commit_message": ${{ toJSON(github.event.head_commit.message) }}
             }
