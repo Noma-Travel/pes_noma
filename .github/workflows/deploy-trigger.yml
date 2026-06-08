@@ -1,0 +1,25 @@
+name: Trigger Production Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  trigger-system-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch system production deploy
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SYSTEM_REPO_PAT }}
+          repository: Noma-Travel/system
+          event-type: pes-noma-main-updated
+          client-payload: |-
+            {
+              "ref": "${{ github.ref }}",
+              "sha": "${{ github.sha }}",
+              "triggered_by": "${{ github.actor }}",
+              "source_repo": "${{ github.repository }}",
+              "commit_author_email": "${{ github.event.head_commit.author.email }}",
+              "commit_message": "${{ github.event.head_commit.message }}"
+            }
