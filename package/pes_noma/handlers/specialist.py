@@ -1014,6 +1014,7 @@ class Specialist:
 
                         # We are turning the tool call into a message to the user
 
+                        if require_tool_consent:
                             tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
                             consent = self.consent_form(validated_result)
                             c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
@@ -1544,7 +1545,10 @@ class Specialist:
                 }
                 self.AGU.mutate_workspace({'action_log': log_entry})
                 print(msg)
-                self.AGU.print_chat(msg, 'text')
+                if yield_user:
+                    self.AGU.print_chat(msg, 'text')
+                else:
+                    self.AGU.print_chat(msg, 'transient')
 
             return {"success": response['success'], "action": function, "input": "", "output": response['output']}
 
