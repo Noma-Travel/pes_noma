@@ -260,6 +260,28 @@ def _accumulate_pipeline_payload(prev: Dict[str, Any], hook_out: Any) -> Dict[st
     return merged
 
 
+def _finalize_after_pipeline_body(acc: Dict[str, Any]) -> Any:
+    """
+    Build the tool payload interpret should see after ``after.run`` hooks.
+
+    Hooks receive ``params['output']`` (original tool body) and may add sibling keys
+    (e.g. weather). Do not return only ``acc['output']`` or augmentations are dropped.
+    """
+    if not isinstance(acc, dict) or not acc:
+        return sanitize(acc)
+    core = acc.get('output')
+    extras = {k: v for k, v in acc.items() if k != 'output'}
+    if core is None:
+        return sanitize(acc)
+    if isinstance(core, dict):
+        if extras:
+            return sanitize({**core, **extras})
+        return sanitize(core)
+    if extras:
+        return sanitize({'result': core, **extras})
+    return sanitize(core)
+
+
 @dataclass
 class RequestContext:
     """Request-scoped context for agent operations."""
@@ -288,6 +310,7 @@ class RequestContext:
     message: str = ''
     tool_response_c_id: str = ''
     last_verification_output: Optional[Any] = None
+    interpret_tool_output: Optional[Any] = None
     # Merged into handler ``_init`` for plan-step tool runs (see ExecutePlan / executor_tool_settings).
     executor_tool_settings: Dict[str, Any] = field(default_factory=dict)
 
@@ -322,6 +345,76 @@ class Specialist:
         for key, value in kwargs.items():
             setattr(context, key, value)
         self._set_context(context)
+
+    def after_hook_tool_result_instruction_generator(self, tool_name: str) -> str:
+        tool_label = str(tool_name or "").strip() or "unknown_tool"
+        return (
+            f"Here are the results from the tool {tool_label}. "
+            "Help the user select one of the options even if it takes him a couple of turns. "
+            "Try to assist the user to select one. "
+            "Once it has selected one, please let me me know (agent_quote) what is it. "
+            "It is ok if it is just a hint, you can also send the id or the name. I'll figure it out."
+        )
+
+    def _build_after_hook_awaiting_output(self, mode: str, tool_name: str = "") -> Dict[str, Any]:
+        output: Dict[str, Any] = {"status": "awaiting", "hook_interpret_skipped": True}
+        c_id = getattr(self._get_context(), "tool_response_c_id", None)
+        if mode == "request_user_selection_from_options":
+            instruction = self.after_hook_tool_result_instruction_generator(tool_name)
+            self.AGU.save_chat(
+                {"role": "system", "content": instruction},
+                next=c_id,
+                msg_type="system",
+            )
+            output["request_user_selection_from_options"] = True
+            output["selection_instruction"] = instruction
+        if c_id:
+            output["next"] = c_id
+        return output
+
+    def _persist_augmented_tool_output(
+        self,
+        *,
+        response_2: Dict[str, Any],
+        response_1: Dict[str, Any],
+        sel_tool: str,
+        augmented_body: Any,
+    ) -> None:
+        """Keep chat, workspace cache, in-memory act() result, and interpret() in sync."""
+        tool_out = response_2.get('output')
+        if not isinstance(tool_out, dict):
+            return
+        serialized = json.dumps(augmented_body, cls=UniversalEncoder)
+        tool_out['content'] = serialized
+        self.AGU.save_chat(
+            dict(tool_out),
+            interface=None,
+            next=self._get_context().tool_response_c_id,
+        )
+        _lh = self._get_context().list_handlers or {}
+        _hroute = _lh.get(sel_tool) or ''
+        if _hroute:
+            _fn = (response_1.get('output') or {}).get('tool_calls', [{}])[0].get(
+                'function'
+            ) or {}
+            _tinput = _fn.get('arguments')
+            _tio = (
+                json.loads(_tinput)
+                if isinstance(_tinput, str)
+                else _tinput
+            )
+            self.AGU.mutate_workspace(
+                {
+                    'cache': {
+                        f'irn:tool_rs:{_hroute}': {
+                            'input': _tio,
+                            'output': augmented_body,
+                        }
+                    }
+                },
+                workspace_id=self._get_context().workspace_id,
+            )
+        self._update_context(interpret_tool_output=augmented_body)
 
     def _dispatch_action_hook(
         self,
@@ -466,9 +559,12 @@ class Specialist:
         """
         Apply ``hooks[tool].after`` only after a **successful** ``act()`` (no ``after.run`` on tool failure).
 
-        Updates persisted tool row + workspace cache when ``after.run`` is configured.
+        When ``after.run`` is configured, each hook receives the current tool payload under
+        ``output`` and may return extra fields to merge in. The merged payload is persisted and
+        exposed to ``interpret()`` via ``interpret_tool_output``.
+
         Returns ``(tool_flag, interpret_mode)`` where ``interpret_mode`` is ``None``,
-        ``'no_tools'``, or ``'skip'``.
+        ``'skip'``, or ``'request_user_selection_from_options'``.
         """
         _tool_hooks = hooks.get(sel_tool) if isinstance(hooks, dict) else None
         _after = (
@@ -506,44 +602,26 @@ class Specialist:
                     _acc_after, _row2.get('output')
                 )
             if tool_flag != 'tool_error':
-                _new_body = sanitize(_acc_after.get('output', _acc_after))
-                _to['content'] = json.dumps(_new_body, cls=UniversalEncoder)
-                self.AGU.save_chat(
-                    dict(_to),
-                    interface=None,
-                    next=self._get_context().tool_response_c_id,
+                _new_body = _finalize_after_pipeline_body(_acc_after)
+                self._persist_augmented_tool_output(
+                    response_2=response_2,
+                    response_1=response_1,
+                    sel_tool=sel_tool,
+                    augmented_body=_new_body,
                 )
-                _lh = self._get_context().list_handlers or {}
-                _hroute = _lh.get(sel_tool) or ''
-                if _hroute:
-                    _fn = (response_1.get('output') or {}).get('tool_calls', [{}])[0].get(
-                        'function'
-                    ) or {}
-                    _tinput = _fn.get('arguments')
-                    _tio = (
-                        json.loads(_tinput)
-                        if isinstance(_tinput, str)
-                        else _tinput
-                    )
-                    self.AGU.mutate_workspace(
-                        {
-                            'cache': {
-                                f'irn:tool_rs:{_hroute}': {
-                                    'input': _tio,
-                                    'output': _new_body,
-                                }
-                            }
-                        },
-                        workspace_id=self._get_context().workspace_id,
-                    )
 
         interpret_mode: Optional[str] = None
         if tool_flag != 'tool_error':
             _im = str(_after.get('interpret_mode') or '').strip().lower()
-            if _im == 'no_tools':
-                interpret_mode = 'no_tools'
-            elif _im == 'skip':
+            if _im == 'skip':
                 interpret_mode = 'skip'
+            elif _im == 'request_user_selection_from_options':
+                interpret_mode = 'request_user_selection_from_options'
+            elif _im == 'no_tools':
+                print(
+                    'after_hook: interpret_mode "no_tools" is deprecated; '
+                    'use "skip" or "request_user_selection_from_options".'
+                )
         return tool_flag, interpret_mode
 
     def _summarize_plan(self, plan_data, state_data, current_step_id, workspace=None):
@@ -831,6 +909,19 @@ class Specialist:
                     ),
                 })
 
+            if tool_result == 'fresh_results':
+                augmented = getattr(self._get_context(), 'interpret_tool_output', None)
+                if augmented is not None:
+                    messages.append({
+                        'role': 'system',
+                        'content': (
+                            'IMPORTANT: Latest tool output for this step (including any after-hook '
+                            'augmentation). Treat this as ground truth when summarizing or deciding next steps.\n\n'
+                            + json.dumps(sanitize(augmented), cls=UniversalEncoder, default=str)
+                        ),
+                    })
+                    self._update_context(interpret_tool_output=None)
+
             # Initialize approved_tools with default empty list
             approved_tools = []
 
@@ -1012,8 +1103,9 @@ class Specialist:
 
                     else:
 
-                        # We are turning the tool call into a message to the user
-
+                        if require_tool_consent:
+                            print(f'Interpret() >> Switching tool call into a message: {validated_result}')
+                            # We are turning the tool call into a message to the user
                             tool_step = 3 # 3  = WAITING_HUMAN   waiting for human confirmation / input
                             consent = self.consent_form(validated_result)
                             c_id = f'{c_id_pre}:{selected_tool}:{tool_step}:{consent["nonce"]}'
@@ -1689,18 +1781,18 @@ class Specialist:
             verification_result = ''
             verification_fail_streak = 0
             completed_tools_this_turn: Set[str] = set()
-            interpret_override: Optional[str] = None  # "no_tools" | "skip" (see action hooks.after.interpret_mode)
+            interpret_override: Optional[str] = None  # "skip" | "request_user_selection_from_options"
             while loops < loop_limit:
                 loops = loops + 1
                 _logger_specialist.debug("loop %d/%d", loops, loop_limit)
 
-                if interpret_override == 'skip':
+                if interpret_override in ('skip', 'request_user_selection_from_options'):
+                    override_mode = str(interpret_override)
                     interpret_override = None
                     self.AGU.print_chat('🤖', 'transient')
-                    output = {'status': 'awaiting', 'hook_interpret_skipped': True}
-                    c_id = getattr(self._get_context(), 'tool_response_c_id', None)
-                    if c_id:
-                        output['next'] = c_id
+                    output = self._build_after_hook_awaiting_output(
+                        override_mode, context.current_action
+                    )
                     return {
                         'success': True,
                         'action': action,
@@ -1734,10 +1826,7 @@ class Specialist:
                         }
 
                 # Step 1: Interpret. We receive the message from the user and we issue a tool command or another message
-                use_no_tools_hook = interpret_override == 'no_tools'
-                if use_no_tools_hook:
-                    interpret_override = None
-                response_1 = self.interpret(no_tools=use_no_tools_hook, tool_result=tool_result)
+                response_1 = self.interpret(tool_result=tool_result)
                 tool_result = ''
 
 
@@ -1786,15 +1875,11 @@ class Specialist:
                             tool_result = 'tool_error'
                         if _im:
                             interpret_override = _im
-                            if _im == 'skip':
+                            if _im in ('skip', 'request_user_selection_from_options'):
                                 self.AGU.print_chat('🤖', 'transient')
-                                output = {
-                                    'status': 'awaiting',
-                                    'hook_interpret_skipped': True,
-                                }
-                                c_id = getattr(self._get_context(), 'tool_response_c_id', None)
-                                if c_id:
-                                    output['next'] = c_id
+                                output = self._build_after_hook_awaiting_output(
+                                    _im, sel_tool
+                                )
                                 return {
                                     'success': True,
                                     'action': action,
