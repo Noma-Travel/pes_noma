@@ -4,7 +4,7 @@ from renglo.schd.schd_controller import SchdController
 from renglo.common import load_config
 from pes_noma.handlers.prompt_manager import PromptManager
 
-from openai import OpenAI
+from langfuse.openai import OpenAI
 from datetime import datetime
 from typing import List, Dict, Any
 from contextvars import ContextVar

@@ -16,7 +16,7 @@ import importlib.resources
 import yaml
 
 
-from openai import OpenAI
+from langfuse.openai import OpenAI
 
 import random
 import json
