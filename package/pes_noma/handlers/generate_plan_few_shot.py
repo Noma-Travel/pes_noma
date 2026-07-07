@@ -4,6 +4,7 @@ Single LLM call with 3 fixed examples + structured output.
 No intent generation. Output is a Plan compatible with commit_plan/specialist.
 """
 import json
+from renglo.agent.llm.model_config import model_for
 import uuid
 import datetime
 from typing import Any, Dict
@@ -90,7 +91,7 @@ PLAN_JSON_SCHEMA = {
 
 SCHEMA_TEXT = json.dumps(PLAN_JSON_SCHEMA["schema"], indent=2)
 
-MODEL = "gpt-4.1"
+MODEL = model_for("planning")
 
 
 # ── System prompt ────────────────────────────────────────────────────────────

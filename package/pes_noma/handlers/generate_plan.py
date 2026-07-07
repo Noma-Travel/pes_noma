@@ -1,4 +1,5 @@
 from __future__ import annotations
+from renglo.agent.llm.model_config import model_for
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple, Protocol, Union
 import copy
@@ -335,7 +336,7 @@ class AIResponsesLLM:
     def __init__(self, agu: AgentUtilities, model: Optional[str] = None):
         # Use the provided AgentUtilities instance instead of creating a new one
         self.AGU = agu
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+        self.model = model or os.getenv("OPENAI_MODEL") or model_for("baseline")
 
     def _supports_structured_outputs(self) -> bool:
         """Check if the model supports structured outputs (json_schema)."""

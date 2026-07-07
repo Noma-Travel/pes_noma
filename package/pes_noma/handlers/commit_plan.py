@@ -1,5 +1,7 @@
 # get_available_documents.py
 from renglo.data.data_controller import DataController
+from renglo.agent.llm.model_config import model_for
+from renglo.agent.llm.client import get_client
 from renglo.docs.docs_controller import DocsController
 from renglo.auth.auth_controller import AuthController
 from renglo.chat.chat_controller import ChatController
@@ -59,9 +61,8 @@ class CommitPlan:
             openai_client = None
 
         self.AI_1 = openai_client
-        #self.AI_1_MODEL = "gpt-4" // This model does not support json_object response format
-        self.AI_1_MODEL = "gpt-3.5-turbo" # Baseline model. Good for multi-step chats
-        self.AI_2_MODEL = "gpt-4o-mini" # This model is not very smart
+        self.AI_1_MODEL = model_for("baseline")
+        self.AI_2_MODEL = model_for("fast")      
 
         # Initialize controllers with config
         self.DAC = DataController(config=self.config)
@@ -360,7 +361,7 @@ class CommitPlan:
             if 'tool_choice' in prompt:
                 params['tool_choice'] = prompt['tool_choice']
 
-            response = self.AI_1.chat.completions.create(**params)
+            response = get_client(params['model']).chat.completions.create(**params)
 
             # chat.completions.create might return an error if you include Decimal() as values
             # Object of type Decimal is not JSON serializable
