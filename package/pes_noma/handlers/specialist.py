@@ -150,7 +150,11 @@ class Specialist:
             pass
 
         if legs_array:
-            summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), you MUST pass the 'legs' parameter with ALL flight segments from the plan (round trip = 2 segments, multi-city = all segments). Use the list below:")
+            summary_lines.append("When calling flight search tools (e.g. search_flights_rextur), respect the Rextur contract:")
+            summary_lines.append("  • Full multi-city itinerary (2–6 open-jaw / chained legs): ONE call with ALL legs in `legs`=[...] — native MC fare (same product as Rextur Multitrechos).")
+            summary_lines.append("  • Round trip / closed loop only (A→B then B→A, city-aware: GIG/SDU = Rio, GRU/CGH = SP): ONE call with BOTH legs — coupled RT fare.")
+            summary_lines.append("  • If native MC / coupled call fails or returns empty, fall back to one-way per leg (or try-casada on closed pairs). Do not invent splits unless nudged.")
+            summary_lines.append("Plan flight segments (chronological):")
             for i, leg in enumerate(legs_array):
                 summary_lines.append(f"  Segment {i}: {leg['origin']} -> {leg['destination']} on {leg['date']}")
             summary_lines.append("")
@@ -158,7 +162,7 @@ class Specialist:
             summary_lines.append(json.dumps(legs_array))
             summary_lines.append("The 'legs' array MUST be ordered by ascending date (earliest first).")
             summary_lines.append("Use the above legs unless the user explicitly asks for something else (e.g. different dates or segments). The 'leg' parameter (0, 1, ...) only indicates which leg you are quoting in this step; 'legs' must always be the full list above.")
-            summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. The only case where 'legs' should have a single item is when the plan has only one flight (one-way trip).")
+            summary_lines.append("Do NOT pass only the current step's segment in 'legs'. Even on Step 1 (return), 'legs' must contain all segments listed above. Native MC (3+ legs) and coupled RT still pass the full list in one call; a single-item `legs` is only for a one-way plan, or as fallback after MC/coupled failed.")
             summary_lines.append("")
 
         STATUS_RANK = {'5': 3, '6': 2, '4': 1, '3': 0, '0': 0}
