@@ -501,6 +501,7 @@ def _heuristic_plan_modify_substrings(m: str) -> bool:
     )
     if any(h in m for h in hints):
         return True
+    # Plan-level schedule/timeline shifts (generic — not tied to any one domain).
     timeline = (
         'change the timeline',
         'different timeline',
